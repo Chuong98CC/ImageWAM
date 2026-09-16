@@ -227,6 +227,16 @@ Separate img/txt weights, joint attention over `[txt | img]`:
     txt += gate₂ · out              img += gate₂ · out
 ```
 
+`img_attn` and `txt_attn` are two separate `SelfAttention` modules (`model.py:375`) — one weight set
+per stream. Each has its own `qkv` (`Linear(3072 → 9216, bias=False)`, one fused matmul producing
+Q/K/V, split by an einops reshape) and `proj` (`Linear(3072 → 3072, bias=False)`). Only the SDPA
+between them is joint.
+
+**`SDPA`** throughout this doc is PyTorch's fused scaled-dot-product attention,
+`F.scaled_dot_product_attention` (`mot.py:195`) — that is, `softmax(QKᵀ/√d)·V`, dispatched at runtime
+to a backend (FlashAttention, memory-efficient, or math). `mot_force_flash_attention` pins it to
+FlashAttention.
+
 ## 1.6 Micro — `SingleStreamBlock` (`model.py:437`)
 
 One stream, fused matmuls:
@@ -362,6 +372,11 @@ Only the residual streams differ in width (3072 vs 1024):
 The per-layer function is wrapped in `torch.utils.checkpoint` when `mot_checkpoint_mixed_attn` is set
 and the module is training (`mot.py:557`) — needed because frozen-FLUX stage 1 still runs autograd
 through all 25 layers to reach the goal encoder.
+
+**The `SDPA` box is the forward path only.** When `_mixed_attention` is called with
+`return_attn_probs=True` it does not use SDPA — it computes `softmax(q·kᵀ·D^-0.5)` explicitly with
+matmuls, because SDPA does not return probabilities (`mot.py:151`). That branch is only taken when
+attention-capture diagnostics are active (`mot.py:1112`).
 
 **Pairing constraint.** The action expert must have exactly the same layer counts as the video expert,
 because the loop pairs them by index (`mot.py:598`, `mot.py:655`). `from_flux2_klein_pretrained`

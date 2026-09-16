@@ -6,6 +6,11 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+# Imported explicitly: `import torch` does not expose this submodule on its own,
+# so the `torch.utils.checkpoint.checkpoint` calls below only worked when
+# something else in the process happened to import it (deepspeed does; a bare
+# unit-test run does not).
+import torch.utils.checkpoint
 
 from .wan_video_dit import modulate, rope_apply
 from .ovis_u1_imports import ensure_ovis_u1_remote_code_importable

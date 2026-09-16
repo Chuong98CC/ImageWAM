@@ -1,4 +1,5 @@
 import torch
+import torch.utils.checkpoint
 
 
 def create_custom_forward(module):

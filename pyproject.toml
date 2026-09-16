@@ -32,7 +32,11 @@ dependencies = [
   "safetensors==0.5.3",
   "termcolor==2.5.0",
   "torch==2.7.1",
-  "torchcodec",
+  # Must stay pinned: torchcodec 0.3-0.5 are the releases built against torch
+  # 2.7, but the cu128 index also carries 0.11.x (built for torch 2.11) and
+  # torchcodec declares no torch dependency, so an unpinned resolve would pick
+  # a wheel that cannot load against 2.7.1.
+  "torchcodec==0.5",
   "torchvision==0.22.1",
   "tqdm==4.66.5",
   "transformers==4.51.3", # Use this line if using Omnigen2 or Ovis
@@ -60,16 +64,24 @@ shared = [
 ]
 
 dim = [
-  "mmcv-full==1.7.2",
+  # "mmcv-full==1.7.2",
   "setuptools<70",
   "wheel",
   "ipdb",
   "pyrallis",
-  "apex"
+  # "apex" -- the PyPI name is not NVIDIA apex; it resolves to an unrelated
+  # package depending on cryptacular, which does not build, and uv locks all
+  # extras, so it blocks `uv lock` for the whole project. NVIDIA apex is a git
+  # install into an activated env:
+  #   uv pip install -e "git+https://github.com/NVIDIA/apex#egg=apex"
 ]
-interndata_pretrain = [
-  "lerobot>=0.4"
-]
+# interndata_pretrain = [
+#   "lerobot>=0.4"
+# ]
+# ^ no lerobot release satisfies this alongside the pins above: lerobot<=0.4.2
+#   needs wandb>=0.20,<0.22 but this project pins wandb==0.23.1, and
+#   lerobot>=0.5.0 needs numpy>=2.0,<2.3 but this project pins numpy==1.26.4.
+#   Re-enable together with those pins, or drop this extra.
 # uv pip install mmcv-full==1.7.2 --no-build-isolation
 
 [tool.setuptools.package-dir]
@@ -80,15 +92,15 @@ where = ["src"]
 include = ["imagewam*"]
 
 # ---------------------------------------------------------------------------
-# uv: 把 torch / torchvision / torchcodec 指向 cu118 wheel index
+# uv: 把 torch / torchvision / torchcodec 指向 cu128 wheel index
 # 安装命令: uv pip install -e .
 # ---------------------------------------------------------------------------
 [[tool.uv.index]]
-name = "pytorch-cu118"
-url = "https://download.pytorch.org/whl/cu118"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu118" }]
-torchvision = [{ index = "pytorch-cu118" }]
-torchcodec = [{ index = "pytorch-cu118" }]
+torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
+torchcodec = [{ index = "pytorch-cu128" }]

@@ -192,9 +192,9 @@ For LIBERO and RoboTwin, we use the preprocessed datasets provided by FastWAM.
 
 ```bash
 mkdir -p data/libero_mujoco3.3.2
-huggingface-cli download yuanty/LIBERO-fastwam \
+hf download yuanty/LIBERO-fastwam \
   --repo-type dataset \
-  --local-dir data/libero_mujoco3.3.2
+  --local-dir /data/libero_mujoco3.3.2
 ```
 
 After downloading the archives, extract them:
@@ -227,9 +227,9 @@ export DATA_ROOT="$(pwd)/data/libero_mujoco3.3.2"
 
 ```bash
 mkdir -p data/robotwin2.0
-huggingface-cli download yuanty/robotwin2.0-fastwam \
+hf download yuanty/robotwin2.0-fastwam \
   --repo-type dataset \
-  --local-dir data/robotwin2.0
+  --local-dir /data/robotwin2.0
 ```
 
 After downloading all split archives, concatenate and extract them:
@@ -542,13 +542,13 @@ If you find this repository helpful for your research, please cite our paper:
 
 ```bibtex
 @misc{zhang2026imagewam,
-      title={ImageWAM: Do World Action Models Really Need Video Generation, or Just Image Editing?}, 
+      title={ImageWAM: Do World Action Models Really Need Video Generation, or Just Image Editing?},
       author={Yuyang Zhang and Wenyao Zhang and Zekun Qi and He Zhang and Haitao Lin and Jingbo Zhang and Yao Mu and Xiaokang Yang and Wenjun Zeng and Xin Jin},
       year={2026},
       eprint={2606.19531},
       archivePrefix={arXiv},
       primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2606.19531}, 
+      url={https://arxiv.org/abs/2606.19531},
 }
 ```
 
