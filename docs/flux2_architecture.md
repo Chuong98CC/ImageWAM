@@ -336,29 +336,30 @@ Everything in Part 1 is frozen or reused as-is by both stages.
             ▼                     ▼                         ▼
       ┌── text ───┐     ┌───── stage 1 ─────┐     ┌───── action ──────┐
       │   Qwen3   │     │  GoalPoseEncoder  │     │   action_expert   │
-      │ 9, 18, 27 │     │   8-D → 8 × 3072  │     │      .pre_dit     │
+      │ 9, 18, 27 │     │   8-D → 8 × 3072  │     │      .pre_dit     │   §2.2  ActionDiTFlux2 — the action expert
+      └─────┬─────┘     └─────────┬─────────┘     └─────────┬─────────┘
      txt [B,L,7680]               │                action [B,16,1024]
             │                     │                         │
 ┌──────── video ────────┐         │                         │
 │  video_expert.pre_dit │         │                         │
-│        (FROZEN)       │         │                         │
+│   (FROZEN — Part 1)   │         │                         │
 └───────────┬───────────┘         │                         │
             │                     │                         │
      txt [B,L,3072]               │                         │
             │                     │                         │
             │                     │                         │
-   txt = [txt | pose]  ◄──────────┘                         │
+   txt = [txt | pose]  ◄──────────┘                         │   §2.6  GoalPoseEncoder output
             │                                               │
             └───────────────────────┬───────────────────────┘
                                     ▼
                   ┌────────────── loop ───────────────┐
                   │          MoT — 25 layers          │
-                  │       video block  (frozen)       │
-                  │      action block (trainable)     │
+                  │       video block  (frozen)       │   §2.4  MoT joint attention (the loop)
+                  │      action block (trainable)     │   §2.5  action K/V layout + mask (in SDPA)
                   └─────────────────┬─────────────────┘
                                     │
                                     ▼
-                         action_expert.post_dit
+                         action_expert.post_dit     §2.2  same module — the decoder half
                                     │
                                     ▼
                           pred_action [B,16,7]
@@ -366,6 +367,17 @@ Everything in Part 1 is frozen or reused as-is by both stages.
                                     ▼
                        L_action   ← the only loss
 ```
+
+Where each Stage 1 section lives in that diagram:
+
+| Section | Appears as |
+| --- | --- |
+| §2.2 `ActionDiTFlux2` | **three** places, one module: the `action_expert .pre_dit` box, the `action block` row inside the MoT box, and `action_expert.post_dit` |
+| §2.3 `pre_dit` / `post_dit` | every `.pre_dit` box, every `post_dit` line — they are the halves the loop sits between |
+| §2.4 MoT joint attention | the `loop` box — the whole 25-layer stack |
+| §2.5 action K/V layout + mask | inside that loop, at the `SDPA + mask` step — not a box of its own |
+| §2.6 `GoalPoseEncoder` | the `stage 1` box; its output merges into `txt = [txt | pose]` |
+| the video expert (Part 1, §1.5–1.6) | the `video_expert.pre_dit` box and the `video block` row inside the MoT box |
 
 The image stream is absent by construction: `x` is a zero-length tensor, and the reference slot holds
 either nothing or a constant learnable stand-in (`stage1_null_image_tokens: 32`). The video expert
@@ -407,7 +419,39 @@ else is separate weights. It carries its own `action_encoder`, `time_in`, and mo
 Weights are initialised from the FLUX.2 checkpoint by `scripts/flux2/preprocess_action_dit_flux2.py`,
 which linearly interpolates mismatched shapes with a `sqrt(src/dst)` alpha scaling to preserve variance.
 
-### 2.3 Micro — MoT joint attention (`mot.py:22`)
+### 2.3 Micro — `pre_dit` / `post_dit`: the split around the DiT
+
+Both experts expose the same two-method interface, and the MoT loop runs **between** them:
+
+```text
+   video  ──► Flux2VideoExpert.pre_dit  ──┐                    ┌── post_dit ──► pred_video
+                                          ├──► MoT loop (25) ──┤
+   action ──► ActionDiTFlux2.pre_dit   ──┘                    └── post_dit ──► pred_action
+```
+
+**`pre_dit` is everything before the transformer blocks.** For the video expert
+(`flux2_video_expert.py:100`) that is: concatenating ref before target in the image stream, `img_in` and
+`txt_in`, the `EmbedND` positional embeddings for both streams, `time_in` for the timestep, and the
+three `Modulation` triples. For the action expert (`action_dit_flux2.py:249`) it is `action_encoder`
+(`action_dim → 1024`), `time_in`, and its two modulation triples. Neither does any cross-expert
+computation — `pre_dit` is a pure per-stream embedding step, and it ignores the `context` argument it
+is given (`action_dit_flux2.py:256`).
+
+**`post_dit` is everything after.** The video expert slices the target tokens back out —
+`img[:, cond_len : cond_len+target_len]`, which drops the ref tokens — and applies `final_layer`
+(`flux2_video_expert.py:177`). The action expert applies `Flux2ActionHead`: adaLN from `vec`, then
+`Linear(1024 → action_dim)` (`action_dit_flux2.py:287`).
+
+**Why the split exists.** `pre_dit` returns more than tokens — it returns a *state dict* carrying the
+positional frequencies, the modulation vectors, and the length bookkeeping (`txt_len`, `cond_len`,
+`target_len`). The MoT layers consume that state, and `post_dit` needs it again at the far end to know
+which slice of the output is the prediction. That is why the three pieces are strictly ordered —
+`pre_dit` for both experts, then the 25-layer loop, then `post_dit` for both — and why the loop can be
+dropped in between without either expert noticing.
+
+The name reads "pre/post the **DiT blocks**", not "pre/post the diffusion".
+
+### 2.4 Micro — MoT joint attention (`mot.py:22`)
 
 `MoT` holds `mixtures = {"video": Flux2VideoExpert, "action": ActionDiTFlux2}` and validates that both
 agree on `num_layers`, `num_heads`, `num_kv_heads`, `attn_head_dim`, `block_protocol` (`mot.py:53`).
@@ -416,12 +460,12 @@ Because both experts emit q/k/v of width 24 × 128 = 3072, they concatenate **wi
 Only the residual streams differ in width:
 
 ```text
-  layer_idx i of 25  (5 double, then 20 single)
+  layer_idx i of 25   (i < 5 → double blocks,  i ≥ 5 → single blocks)
 
      video expert                                    action expert
   ┌──────────────────┐                            ┌──────────────────┐
-  │ DoubleStreamBlock│                            │SlimFlux2Double   │
-  │  3072-wide       │                            │  Block, 1024-wide│
+  │   video block i  │                            │  action block i  │
+  │  3072-wide       │                            │  1024-wide       │
   │  own weights     │                            │  own weights     │
   └────────┬─────────┘                            └────────┬─────────┘
            │ q,k,v  [B, L_v, 3072]                         │ q,k,v  [B, L_a, 3072]
@@ -437,6 +481,29 @@ Only the residual streams differ in width:
      video attn out                                  action attn out
      (residual + MLP in video weights)               (residual + MLP in action weights)
 ```
+
+**This is drawn once because it holds for both block types.** The concatenate–attend–split core is
+byte-for-byte the same idea in the double loop (`mot.py:626`) and the single loop (`mot.py:670`): each
+expert projects q/k/v in its own weights, the two are concatenated along the sequence, one SDPA runs,
+and the result is split back at `L_v`.
+
+It is safe to reuse one mask for both because `L_v` is the same in either case: the double block's
+`_prepare_qkv` concatenates `[txt | img]` internally, and the single block's stream is already
+`cat([txt, img])`. So the total sequence length is `txt + ref + target + action` throughout, which is
+why `_build_mot_attention_mask_flux2` can return one mask and clone it for `single`.
+
+What differs is what each side does *around* the shared core:
+
+| | double block (`i < 5`) | single block (`i ≥ 5`) |
+| --- | --- | --- |
+| video q/k/v produced by | `v_block._prepare_qkv(img, txt, …)` | `_flux2_video_single_io(v_block, stream, …)` (`mot.py:543`) |
+| video output path | `_apply_residuals` — splits the attention output back into txt and img, **two** residuals | `_out` — one residual over the whole stream |
+| video MLP timing | **after** the attention; reads the post-attention stream | fused into `linear1`, computed *alongside* q/k/v **before** the attention |
+| action side | `a_block.prepare_qkv` → `apply_post` | same two methods (`action_dit_flux2.py:106`) |
+
+The action side is uniform: both `SlimFlux2DoubleBlock` and `SlimFlux2SingleBlock` expose
+`prepare_qkv` / `apply_post`, so the MoT loop calls them identically and only their internals differ
+(§1.5 vs §1.6 for what those internals are).
 
 The per-layer function is wrapped in `torch.utils.checkpoint` when `mot_checkpoint_mixed_attn` is set
 and the module is training (`mot.py:557`) — needed because stage 1 runs autograd through all 25 frozen
@@ -459,7 +526,7 @@ expected_action_shape = {
 # hidden_dim is the ONE thing left free (1024)
 ```
 
-### 2.4 Micro — the action K/V layout and its baseline mask (`imagewam.py:2312`)
+### 2.5 Micro — the action K/V layout and its baseline mask (`imagewam.py:2312`)
 
 `_build_mot_attention_mask_flux2` produces a block-structured **bidirectional** keep-mask (there is no
 causal masking here, despite `causal_attn_fn` existing in the upstream ref-cache path). The same tensor
@@ -481,7 +548,7 @@ This is the layout the baseline (non-prior) path uses with every block populated
 `[txt | pose | null? | action]` — the "stable prefix" row and the action row are all that remain.
 `text_attention_mask` additionally zeroes padding columns of the txt block (`imagewam.py:2343`).
 
-### 2.5 Micro — `GoalPoseEncoder` (`goal_pose_prior.py:85`)
+### 2.6 Micro — `GoalPoseEncoder` (`goal_pose_prior.py:85`)
 
 ```text
    goal_pose [B, 8]
@@ -502,7 +569,7 @@ positional treatment as text tokens — axis 3 of the 4-axis id, not the image a
 
 ## Stage 2 — integrating vision
 
-### 2.6 Macro — stage 2
+### 2.7 Macro — stage 2
 
 Same spine as stage 1, with the image rail restored and the aggregator spliced into the layer loop:
 
@@ -526,7 +593,7 @@ Same spine as stage 1, with the image rail restored and the aggregator spliced i
             └─────────┬─────────┘               └─────────┬─────────┘
                       │                                   │
                       └─────────────────┬─────────────────┘
-                                        │ ← LIT blocks attach in here (§2.7–2.10)
+                                        │ ← LIT blocks attach in here (§2.8–2.11)
                                         ▼
                      ┌─────────────── loop ────────────────┐
                      │           MoT — 25 layers           │
@@ -551,18 +618,18 @@ Where each stage-2 block attaches — these are the only new pieces:
 
 | Block | Reads | Writes into | Section |
 | --- | --- | --- | --- |
-| `SemanticVisualAggregator` | txt + ref-image features out of each video block | `goal_latents`, carried across all 25 layers | §2.7 |
-| `to_key` / `to_value` | `goal_latents`, 100 × 768 | the action queries' K/V, per layer | §2.8 |
-| `pose_norm` + `GoalPoseDecoder` | `goal_latents[:, :8]` | `L_pose` (weight 0.3) | §2.7 |
-| cold-start gate | — | the action attention logits, as a float mask | §2.10 |
-| firewall / plan-B regime | — | which of those channels are visible at all | §2.10 |
+| `SemanticVisualAggregator` | txt + ref-image features out of each video block | `goal_latents`, carried across all 25 layers | §2.8 |
+| `to_key` / `to_value` | `goal_latents`, 100 × 768 | the action queries' K/V, per layer | §2.9 |
+| `pose_norm` + `GoalPoseDecoder` | `goal_latents[:, :8]` | `L_pose` (weight 0.3) | §2.8 |
+| cold-start gate | — | the action attention logits, as a float mask | §2.11 |
+| firewall / plan-B regime | — | which of those channels are visible at all | §2.11 |
 
 The prior writes to the **action** stream only. The video stream runs as Part 1 describes; stage 2
 reads from it but never writes to it.
 
 Loss: `0.5 · L_video + 1.0 · L_action + 0.3 · L_pose`.
 
-### 2.7 Micro — `SemanticVisualAggregator` (`goal_pose_prior.py:309`)
+### 2.8 Micro — `SemanticVisualAggregator` (`goal_pose_prior.py:309`)
 
 100 learnable latents (8 pose + 92 context, dim 768) updated **once per FLUX layer**, with the 25
 layers grouped into 5 parameter sets (`layer_idx // 5`):
@@ -597,7 +664,7 @@ Key facts:
 - `pose_norm` is a `LayerNorm` (`imagewam.py:216`) applied to the first 8 latents before
   `GoalPoseDecoder`; along with the decoder it is randomly initialised when bridging from stage 1.
 
-### 2.8 Micro — `SemanticVisualAggregatorGroup` (`goal_pose_prior.py:243`)
+### 2.9 Micro — `SemanticVisualAggregatorGroup` (`goal_pose_prior.py:243`)
 
 ```text
    queries (100 × 768)
@@ -618,11 +685,11 @@ Key facts:
 ```
 
 `gate_bias_init` seeds `syn_gate_bias`, a learnable scalar on the group used by the cold-start gate
-(§2.10). `zero_init_value` optionally zeroes `to_value`; it is **mutually exclusive** with
+(§2.11). `zero_init_value` optionally zeroes `to_value`; it is **mutually exclusive** with
 `gate_pose_tokens=False` and raises (`goal_pose_prior.py:373`) — see the comment there for why the
 gate must then be carried by the logit bias alone.
 
-### 2.9 Micro — synthetic K/V projection (`mot.py:694`)
+### 2.10 Micro — synthetic K/V projection (`mot.py:694`)
 
 The 100 latents are not usable as attention keys directly: they are 768-wide and live in the
 aggregator's own space, while the action attention needs 3072-wide keys in FLUX head layout with
@@ -643,7 +710,7 @@ positional encoding applied.
 The synthetic time value `3.0` keeps these tokens positionally distinct from text (axis 3), image
 (0.0 / 10.0) and action (2.0) — see the id table in §1.4.
 
-### 2.10 Micro — firewall, plan B, cold-start gate
+### 2.11 Micro — firewall, plan B, cold-start gate
 
 `build_stage2_action_attention_mask` (`goal_pose_prior.py:631`) builds the action queries' K/V layout.
 `ref_len=0` **literally removes the raw image columns** — the firewall is an architectural absence, not
@@ -685,14 +752,14 @@ to ignore noise. It is *additive on a float mask*, not a bool mask:
 reproduces stage 1's `[txt | pose | action]` topology — which is also exactly what B2+ blackout falls
 back to.
 
-### 2.11 Micro — inside the layer loop
+### 2.12 Micro — inside the layer loop
 
 The MoT box in the stage-2 macro is recurrent: the aggregator is re-run after *every* video block and
 hands updated latents forward. This is the connection the flat spine can't show:
 
 ```text
 latents — 100 learnable queries × 768
-                 │                      initialised once, before layer 0  (§2.7)
+                 │                      initialised once, before layer 0  (§2.8)
                  ▼                      carried across all 25 layers
   ┌─────────── video ────────────┐
   │        video block i         │
@@ -731,7 +798,7 @@ latents — 100 learnable queries × 768
 Note that the aggregator and the action block both live *inside* layer `i`, between the video block and
 the next layer — the action block's queries see the synthetic K/V that was just produced.
 
-### 2.12 Micro — the Stage 1 → Stage 2 bridge
+### 2.13 Micro — the Stage 1 → Stage 2 bridge
 
 Stage 2 **requires** `stage1_checkpoint` unless `resume` is set, so it can never silently train from the
 ActionDiT init. The checkpoint bridge is fail-closed; the only permitted key differences come from the
