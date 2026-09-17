@@ -38,6 +38,28 @@ and what they cost, see `goal_pose_prior_flux2.md` (operations manual) and `CHAN
                                                       └──────────────────────────────────────┘
 ```
 
+### A note on the name "video expert"
+
+The `MoT` has exactly two expert slots, and ImageWAM's vocabulary names them `"video"` and `"action"`
+(`mixtures={"video": …, "action": …}`). Every backbone in the repo fills the first slot under that same
+name — `wan_video_expert.py`, `omnigen2_video_expert.py`, `ovis_u1_video_expert.py`,
+`dim_video_expert.py`, `flux2_video_expert.py` — and the MoT only requires the filler to agree on
+`num_layers` / `num_heads` / `num_kv_heads` / `attn_head_dim` / `block_protocol`. It is a structural
+role, not a claim about the backbone.
+
+**The FLUX.2 video expert is a pure image model.** `flux2/autoencoder.py` contains no temporal code at
+all — no 3D convolutions, no causal time padding, no frame compression. The one place this repo handles
+temporal alignment is `_compute_video_loss_per_sample`, which reads `vae.temporal_downsample_factor`;
+that lives in the DIM loss path (`imagewam.py:3032`) and is never called for FLUX.2. All four FLUX.2
+loss paths use a plain `mse_loss(...).flatten(1).mean(dim=1)` with no temporal grouping.
+
+"Video" describes the **task**, not the architecture. The data is video and the target is a future
+frame: `build_inputs_flux2` takes `video[:, :, 0]` as the reference and `video[:, :, -1]` as the target.
+So the model does one-step video prediction with a backbone that has no notion of time — two stills,
+encoded independently, concatenated into a single sequence with no frame-to-frame attention. The name
+would be less confusing as `visual_expert`, but it is baked into the `mixtures` dict and into every
+stack's filename.
+
 ---
 
 # Part 1 — Upstream FLUX.2 Klein image model
@@ -221,8 +243,8 @@ Separate img/txt weights, joint attention over `[txt | img]`:
     txt += gate₁ · out              img += gate₁ · out
     │                               │
     txt_mlp: Linear(3072→2m)        img_mlp: Linear(3072→2m)
-        → SiLUActivation                → SiLUActivation
-        → Linear(m→3072)                → Linear(m→3072)
+    → SiLUActivation                → SiLUActivation
+    → Linear(m→3072)                → Linear(m→3072)
     │                               │
     txt += gate₂ · out              img += gate₂ · out
 ```
@@ -426,7 +448,7 @@ Both experts expose the same two-method interface, and the MoT loop runs **betwe
 ```text
    video  ──► Flux2VideoExpert.pre_dit  ──┐                    ┌── post_dit ──► pred_video
                                           ├──► MoT loop (25) ──┤
-   action ──► ActionDiTFlux2.pre_dit   ──┘                    └── post_dit ──► pred_action
+   action ──► ActionDiTFlux2.pre_dit    ──┘                    └── post_dit ──► pred_action
 ```
 
 **`pre_dit` is everything before the transformer blocks.** For the video expert
@@ -533,19 +555,33 @@ causal masking here, despite `causal_attn_fn` existing in the upstream ref-cache
 is used for both `double_joint` and `single`:
 
 ```text
-              key ►   txt      ref     target   action
-          ┌────────┬────────┬────────┬────────┐
- txt/ref  │   ✓    │   ✓    │   ·    │   ·    │   stable prefix:
-          ├────────┼────────┼────────┼────────┤   never reads noisy tokens
- target   │   ✓    │   ✓    │   ✓    │   ·    │
-          ├────────┼────────┼────────┼────────┤
- action   │   ✓    │   ✓    │   ·    │   ✓    │   never reads the noisy target
-          └────────┴────────┴────────┴────────┘
+           key ►   text     ref     target   action
+                ┌────────┬────────┬────────┬────────┐
+           text │   ✓    │   ✓    │   ·    │   ·    │
+                ├────────┼────────┼────────┼────────┤
+            ref │   ✓    │   ✓    │   ·    │   ·    │
+                ├────────┼────────┼────────┼────────┤
+         target │   ✓    │   ✓    │   ✓    │   ·    │
+                ├────────┼────────┼────────┼────────┤
+         action │   ✓    │   ✓    │   ·    │   ✓    │
+                └────────┴────────┴────────┴────────┘
 ```
 
-This is the layout the baseline (non-prior) path uses with every block populated. **Stage 1 passes
-`target_len=0`**, so the target columns simply do not exist and the action queries see
-`[txt | pose | null? | action]` — the "stable prefix" row and the action row are all that remain.
+The four rows are the four row-blocks the code assigns with five separate rules (`imagewam.py:2329`):
+text rows read `txt + ref`; ref rows read `txt + ref`; target rows read `txt + ref + target`; action rows
+read `txt + ref + action`. Nothing in the mask distinguishes `txt` from `ref` *as keys* — every rule
+that admits one admits the other — which is what makes the first two rows identical and earns them the
+name **stable prefix**: they are the only blocks that never read anything noisy.
+
+Two consequences worth reading off the table:
+
+- **The target block is invisible to the action block**, and vice versa. The action block therefore sees
+  no predicted future; that is the separation the stage-2 firewall later widens.
+- **Stage 1 passes `target_len=0`**, which deletes the `target` row and column entirely rather than
+  masking them. The action row then reads `txt + ref + action`, and if the reference is also absent
+  (`cond_len=0`, no null tokens), `txt + action` — stage 1's `[txt | pose | action]`.
+
+This is the layout the baseline (non-prior) path uses with every block populated.
 `text_attention_mask` additionally zeroes padding columns of the txt block (`imagewam.py:2343`).
 
 ### 2.6 Micro — `GoalPoseEncoder` (`goal_pose_prior.py:85`)
@@ -571,42 +607,57 @@ positional treatment as text tokens — axis 3 of the 4-axis id, not the image a
 
 ### 2.7 Macro — stage 2
 
-Same spine as stage 1, with the image rail restored and the aggregator spliced into the layer loop:
+Same spine as stage 1, with the image rail restored and the LIT block spliced into the layer loop. The
+loop box is drawn open: inside every one of the 25 layers the order is video block →
+`SemanticVisualAggregator` → action block, and the aggregator never touches the video stream itself.
+§2.8 walks that interior; the sections after it take the three boxes apart one at a time.
 
 ```text
-        ref image            prompt                 noisy action
-            │                   │                         │
-            ▼                   ▼                         ▼
-       ┌── VAE ──┐       ┌─── text ────┐           action [B,16,7]
-       │   VAE   │       │    Qwen3    │                  │
-       │  encode │       │  9, 18, 27  │                  ▼
-       └────┬────┘       └──────┬──────┘        ┌───── action ──────┐
-            │                   │               │   action_expert   │
-            ▼                   ▼               │      .pre_dit     │
-       ref tokens        txt [B,L,7680]         └─────────┬─────────┘
-            │                   │                         │
-            └─────────┬─────────┘                         │
-                      ▼                                   │
-            ┌────── video ──────┐               ┌───── action ──────┐
-            │    video_expert   │               │   action_expert   │
-            │      .pre_dit     │               │      .pre_dit     │
-            └─────────┬─────────┘               └─────────┬─────────┘
-                      │                                   │
-                      └─────────────────┬─────────────────┘
-                                        │ ← LIT blocks attach in here (§2.8–2.11)
-                                        ▼
-                     ┌─────────────── loop ────────────────┐
-                     │           MoT — 25 layers           │
-                     │         5 double + 20 single        │
-                     │      video block | action block     │
-                     └──────────────────┬──────────────────┘
-                                        │
-                      ┌─────────────────┴─────────────────┐
-                      ▼                                   ▼
-            video_expert.post_dit              action_expert.post_dit
-                      │                                   │
-                      ▼                                   ▼
-            pred_video [B,N,128]                pred_action [B,16,7]
+        ref image              prompt                 noisy action
+            │                     │                         │
+            ▼                     ▼                         ▼
+      ┌─── VAE ───┐        ┌─── text ────┐           action [B,16,7]
+      │   encode  │        │    Qwen3    │                  │
+      └─────┬─────┘        │  9, 18, 27  │                  ▼
+            │              └──────┬──────┘        ┌───── action ──────┐
+            ▼                     ▼               │   action_expert   │
+       ref tokens          txt [B,L,7680]         │      .pre_dit     │
+            │                     │               └─────────┬─────────┘
+            └──────────┬──────────┘                         │
+                       ▼                                    │
+             ┌────── video ──────┐                          │
+             │    video_expert   │                          │
+             │      .pre_dit     │                          │
+             └─────────┬─────────┘                          │
+                       │                                    │
+                       └─────────────────┬──────────────────┘
+                                         ▼
+                 ┌───────────────────── loop ─────────────────────┐   §2.8  how the loop is wired
+                 │                MoT — 25 layers                 │
+                 │              5 double + 20 single              │
+                 │    ┌──────────────────────────────────────┐    │   §1.5–1.6  frozen in stage 1, trainable now
+                 │    │            video block i             │    │
+                 │    │          txt + img features          │    │
+                 │    └──────────────────┬───────────────────┘    │
+                 │                       ▼                        │
+                 │    ┌──────────────────────────────────────┐    │   §2.9  the LIT block — 100 learnable queries
+                 │    │       SemanticVisualAggregator       │    │   §2.10  group = layer_idx // 5
+                 │    │  100 latents × 768  ·  group i // 5  │    │
+                 │    └──────────────────┬───────────────────┘    │
+                 │             syn K/V  ·  100 × 3072             │   §2.11  projected + RoPE'd
+                 │                       ▼                        │
+                 │    ┌──────────────────────────────────────┐    │   §2.12  cold-start gate + firewall
+                 │    │            action block i            │    │
+                 │    │  K/V ← [txt | ref? | syn | action]   │    │
+                 │    └──────────────────────────────────────┘    │
+                 └───────────────────────┬────────────────────────┘   latents are carried across all 25 layers
+                                         │
+            ┌────────────────────────────┴──────────────────┐
+            ▼                                               ▼
+  video_expert.post_dit                          action_expert.post_dit
+            │                                               │
+            ▼                                               ▼
+  pred_video [B,N,128]                            pred_action [B,16,7]
 ```
 
 The VAE (`self.vae`) and Qwen3 (`self.text_encoder`) are separate modules feeding the video expert, but
@@ -618,18 +669,67 @@ Where each stage-2 block attaches — these are the only new pieces:
 
 | Block | Reads | Writes into | Section |
 | --- | --- | --- | --- |
-| `SemanticVisualAggregator` | txt + ref-image features out of each video block | `goal_latents`, carried across all 25 layers | §2.8 |
-| `to_key` / `to_value` | `goal_latents`, 100 × 768 | the action queries' K/V, per layer | §2.9 |
-| `pose_norm` + `GoalPoseDecoder` | `goal_latents[:, :8]` | `L_pose` (weight 0.3) | §2.8 |
-| cold-start gate | — | the action attention logits, as a float mask | §2.11 |
-| firewall / plan-B regime | — | which of those channels are visible at all | §2.11 |
+| the layer loop | — | the order inside every layer: video block → aggregate → action block | §2.8 |
+| `SemanticVisualAggregator` | txt + ref-image features out of each video block | `goal_latents`, carried across all 25 layers | §2.9 |
+| `SemanticVisualAggregatorGroup` — `to_key` / `to_value` | `goal_latents`, 100 × 768 | this layer's synthetic K/V | §2.10 |
+| `project_kv` + RoPE | those K/V | the `syn` columns of the action K/V | §2.11 |
+| `pose_norm` + `GoalPoseDecoder` | `goal_latents[:, :8]` | `L_pose` (weight 0.3) | §2.9 |
+| cold-start gate | — | the action attention logits, as a float mask | §2.12 |
+| firewall / plan-B regime | — | which of those channels are visible at all | §2.12 |
 
 The prior writes to the **action** stream only. The video stream runs as Part 1 describes; stage 2
 reads from it but never writes to it.
 
 Loss: `0.5 · L_video + 1.0 · L_action + 0.3 · L_pose`.
 
-### 2.8 Micro — `SemanticVisualAggregator` (`goal_pose_prior.py:309`)
+### 2.8 Micro — inside the layer loop
+
+The macro draws one layer. That box repeats 25 times, and the only state the *aggregator* carries from
+one iteration to the next is `goal_latents` — it is re-run after *every* video block and hands the
+updated latents forward, so layer `i` reads what layer `i-1` saw:
+
+```text
+latents — 100 learnable queries × 768
+                 │                      initialised once, before layer 0  (§2.9)
+                 ▼                      carried across all 25 layers
+  ┌─────────── video ────────────┐
+  │        video block i         │
+  │    txt + img features out    │
+  └──────────────┬───────────────┘
+                 │    i < 5 → double block      i >= 5 → single block
+                 ▼
+  ┌───────── aggregate ──────────┐
+  │   SemanticVisualAggregator   │
+  │   self → semantic → visual   │
+  └──────────────┬───────────────┘
+                 │    group = i // 5
+                 │    updated latents ──► carried to the next layer
+    ┌────────────┴───────────────┐
+    ▼                            ▼
+  latents[:, :8]             latents (all 100)
+    │                            │
+    ▼                            ▼
+  pose_norm +                to_key / to_value
+  GoalPoseDecoder                │
+    │                            ▼
+    ▼                       syn K/V [B,100,3072]
+    L_pose  (×0.3)               │
+                                 │
+                                 ▼
+                    ┌──────── attend ─────────┐
+                    │      action block i     │
+                    │   Q   ← action tokens   │
+                    │ K/V ← [txt|ref?|syn|act]│
+                    └────────────┬────────────┘
+                                 │
+                                 ▼
+                              action tokens → next layer
+```
+
+Note that the aggregator and the action block both live *inside* layer `i`, between the video block and
+the next layer — the action block's queries see the synthetic K/V that was just produced.
+
+### 2.9 Micro — `SemanticVisualAggregator` (`goal_pose_prior.py:309`)
 
 100 learnable latents (8 pose + 92 context, dim 768) updated **once per FLUX layer**, with the 25
 layers grouped into 5 parameter sets (`layer_idx // 5`):
@@ -664,7 +764,7 @@ Key facts:
 - `pose_norm` is a `LayerNorm` (`imagewam.py:216`) applied to the first 8 latents before
   `GoalPoseDecoder`; along with the decoder it is randomly initialised when bridging from stage 1.
 
-### 2.9 Micro — `SemanticVisualAggregatorGroup` (`goal_pose_prior.py:243`)
+### 2.10 Micro — `SemanticVisualAggregatorGroup` (`goal_pose_prior.py:243`)
 
 ```text
    queries (100 × 768)
@@ -685,11 +785,11 @@ Key facts:
 ```
 
 `gate_bias_init` seeds `syn_gate_bias`, a learnable scalar on the group used by the cold-start gate
-(§2.11). `zero_init_value` optionally zeroes `to_value`; it is **mutually exclusive** with
+(§2.12). `zero_init_value` optionally zeroes `to_value`; it is **mutually exclusive** with
 `gate_pose_tokens=False` and raises (`goal_pose_prior.py:373`) — see the comment there for why the
 gate must then be carried by the logit bias alone.
 
-### 2.10 Micro — synthetic K/V projection (`mot.py:694`)
+### 2.11 Micro — synthetic K/V projection (`mot.py:694`)
 
 The 100 latents are not usable as attention keys directly: they are 768-wide and live in the
 aggregator's own space, while the action attention needs 3072-wide keys in FLUX head layout with
@@ -710,7 +810,7 @@ positional encoding applied.
 The synthetic time value `3.0` keeps these tokens positionally distinct from text (axis 3), image
 (0.0 / 10.0) and action (2.0) — see the id table in §1.4.
 
-### 2.11 Micro — firewall, plan B, cold-start gate
+### 2.12 Micro — firewall, plan B, cold-start gate
 
 `build_stage2_action_attention_mask` (`goal_pose_prior.py:631`) builds the action queries' K/V layout.
 `ref_len=0` **literally removes the raw image columns** — the firewall is an architectural absence, not
@@ -751,52 +851,6 @@ to ignore noise. It is *additive on a float mask*, not a bool mask:
 `gate_pose_tokens=false`: the **92 context columns are gated, the 8 pose columns stay open**, so step 0
 reproduces stage 1's `[txt | pose | action]` topology — which is also exactly what B2+ blackout falls
 back to.
-
-### 2.12 Micro — inside the layer loop
-
-The MoT box in the stage-2 macro is recurrent: the aggregator is re-run after *every* video block and
-hands updated latents forward. This is the connection the flat spine can't show:
-
-```text
-latents — 100 learnable queries × 768
-                 │                      initialised once, before layer 0  (§2.8)
-                 ▼                      carried across all 25 layers
-  ┌─────────── video ────────────┐
-  │        video block i         │
-  │    txt + img features out    │
-  └──────────────┬───────────────┘
-                 │    i < 5 → double block      i >= 5 → single block
-                 ▼
-  ┌───────── aggregate ──────────┐
-  │   SemanticVisualAggregator   │
-  │   self → semantic → visual   │
-  └──────────────┬───────────────┘
-                 │    group = i // 5
-                 │    updated latents ──► carried to the next layer
-    ┌────────────┴───────────────┐
-    ▼                            ▼
-  latents[:, :8]             latents (all 100)
-    │                            │
-    ▼                            ▼
-  pose_norm +                to_key / to_value
-  GoalPoseDecoder                │
-    │                            ▼
-    ▼                       syn K/V [B,100,3072]
-    L_pose  (×0.3)               │
-                                 │
-                                 ▼
-                    ┌──────── attend ─────────┐
-                    │      action block i     │
-                    │   Q   ← action tokens   │
-                    │ K/V ← [txt|ref?|syn|act]│
-                    └────────────┬────────────┘
-                                 │
-                                 ▼
-                              action tokens → next layer
-```
-
-Note that the aggregator and the action block both live *inside* layer `i`, between the video block and
-the next layer — the action block's queries see the synthetic K/V that was just produced.
 
 ### 2.13 Micro — the Stage 1 → Stage 2 bridge
 
