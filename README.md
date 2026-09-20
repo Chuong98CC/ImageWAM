@@ -43,7 +43,8 @@ export DATASET_STATS_PATH=./LIT_ckpt/imagewam/lit_stage2/dataset_stats.json
 
 ```bash
 # LIBERO (in-distribution)
-NUM_GPUS=8 FLUX2_VARIANT=4b bash scripts/flux2/run_eval_flux2_libero.sh
+# NUM_GPUS=8 FLUX2_VARIANT=4b bash scripts/flux2/run_eval_flux2_libero.sh
+NUM_GPUS=1 MAX_TASKS_PER_GPU=2 FLUX2_VARIANT=4b bash scripts/flux2/run_eval_flux2_libero.sh
 
 # LIBERO-Plus (out of distribution): 10,030 tasks, one episode each
 LIBERO_PLUS_FIX_LANG=1 NUM_GPUS=8 FLUX2_VARIANT=4b bash scripts/flux2/run_eval_flux2_libero_plus.sh

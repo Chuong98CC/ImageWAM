@@ -416,6 +416,9 @@ What is trainable (`apply_trainable_policy`, `imagewam.py:5364`):
 | `goal_pose_encoder` | **trainable** |
 | video expert — all 25 blocks | frozen, forced `.eval()` |
 
+Stage 2 and the baseline use the same two gates with different whitelists, and LoRA is a third
+path reachable only from the baseline — Part 5 covers all of them.
+
 Loss: `1.0 · L_action`, nothing else. No image loss and no pose loss exist in this stage.
 
 ### 2.2 Micro — `ActionDiTFlux2`, the expert being pretrained (`action_dit_flux2.py:146`)
@@ -526,6 +529,18 @@ What differs is what each side does *around* the shared core:
 The action side is uniform: both `SlimFlux2DoubleBlock` and `SlimFlux2SingleBlock` expose
 `prepare_qkv` / `apply_post`, so the MoT loop calls them identically and only their internals differ
 (§1.5 vs §1.6 for what those internals are).
+
+The seam is upstream's *private* split, not its public API: `DoubleStreamBlock._prepare_qkv` /
+`_apply_residuals` (`model.py:569`, `model.py:614`) and `SingleStreamBlock._qkv` / `_out`
+(`model.py:468`, `model.py:482`). Upstream's own `forward_kv_extract` / `forward_kv_cached`
+(`model.py:170`, `model.py:267`) are a decoy — causal, single-stream, and for reference images; the
+MoT calls none of them.
+
+**Stage 2 breaks the joint call.** Everything above describes `_forward_flux2`, which baseline and
+stage 1 use. `_forward_flux2_stage2` (`mot.py:775`) runs *two* attentions per layer instead: the
+video stream attends only itself (`mot.py:863`) and the action stream attends
+`[txt | ref? | syn | action]` (`mot.py:891`). The video expert stops reading action tokens — which
+is what lets §3.1 prefill the video half alone and cache it.
 
 The per-layer function is wrapped in `torch.utils.checkpoint` when `mot_checkpoint_mixed_attn` is set
 and the module is training (`mot.py:557`) — needed because stage 1 runs autograd through all 25 frozen
@@ -883,3 +898,822 @@ prefix constants at `goal_pose_prior.py:64`:
   and hangs the job.
 - **Metrics must be emitted on every rank, every step** — `_goal_prior_diagnostics` always emits every
   key for the same reason.
+
+---
+
+# Part 3 — inference
+
+Everything above is training. Deployment runs the same modules in a different order, and the difference
+is not cosmetic: **the video stream is computed once per action chunk and cached; only the action expert
+is re-run per denoising step.** That hoist is what makes a 10–20 step action diffusion affordable.
+
+## 3.0 Macro block diagram
+
+```text
+        ref image              prompt              noise x_T [B,16,7]
+            │                     │                         │
+            ▼                     ▼                         │
+       ┌── VAE ──┐         ┌─── text ────┐                  │
+       │  encode │         │    Qwen3    │                  │
+       └────┬────┘         │  9, 18, 27  │                  │
+            │              └──────┬──────┘                  │
+            ▼                     ▼                         │
+       ref tokens          txt [B,L,7680]                   │
+            │                     │                         │
+            └──────────┬──────────┘                         │
+                       ▼                                    │
+            ┌─────── video ───────┐                         │
+            │     video_expert    │                         │
+            │ .pre_dit (0 tokens) │                         │
+            └──────────┬──────────┘                         │
+                       │                                    │
+                       ▼                                    │
+   ┌─────────────── prefill ───────────────┐                │          §3.1  the video stream runs once
+   │    video blocks ×25  +  aggregator    │                │
+   │   cache per layer:  txt · ref? · syn  │                │
+   │   all of it computed once per chunk   │                │
+   └───────────────────┬───────────────────┘                │
+                       │                                    │
+                       └─────────────────┬──────────────────┘
+                                         ▼
+                ┌──────────────────── denoise ─────────────────────┐   §3.3  action-only, ×N
+                │  action_expert.pre_dit → blocks ×25 → post_dit   │   §3.2  the layout is the infer mode
+                │       K/V ← [ txt | ref? | syn | action ]        │
+                │   x ← x + v · Δσ     (N = num_inference_steps)   │   §3.3  Euler step, σ: 1 → 0
+                └────────────────────────┬─────────────────────────┘
+                                         │
+                                         ▼
+                               action chunk [B,16,7]
+                                         │
+                                         ▼
+                       execute replan_steps, then re-encode            §3.5  the closed loop
+```
+
+| Phase | What runs | How often |
+| --- | --- | --- |
+| encode + prefill | VAE, Qwen3, `video_expert.pre_dit`, 25 video blocks, the aggregator | once per chunk |
+| denoise | 25 action blocks | `num_inference_steps` times |
+
+`prefill` and `denoise` are the two halves of the *same* 25-layer stack — §2.4's MoT picture still
+describes one layer, inference just runs the halves a different number of times.
+
+## 3.1 Micro — prefill: the video stream runs once
+
+Two entry points, one per stage family:
+
+| | baseline and stage 1 | stage 2 |
+| --- | --- | --- |
+| called from | `_infer_action_flux2_baseline` (`imagewam.py:4121`) | `_infer_action_flux2_stage2` (`imagewam.py:4360`) |
+| prefill | `prefill_flux2_video_cache` (`mot.py:1023`) | `prefill_flux2_goal_prior_cache` (`mot.py:1158`) |
+| cached per layer | `k`, `v` | `txt_k/v`, `ref_k/v`, `syn_k/v`, `gate_bias`, `gated_span`, `mode` |
+| aggregator | — | run once per layer during prefill |
+
+```text
+        training                                    inference
+   ┌─────────────────────┐                   ┌─────────────────────┐
+   │   video block   i   │  both experts     │   video block   i   │   ×25, once
+   │   action block  i   │  run every layer  │   + aggregator      │
+   └─────────────────────┘                   └──────────┬──────────┘
+                                                        │ cache K/V
+                                                        ▼
+                                              ┌─────────────────────┐
+                                              │   action block  i   │   ×25, per step
+                                              └─────────────────────┘
+```
+
+The stage-2 prefill does one thing the baseline's does not: it also runs `_flux2_update_goal_latents` and
+`_flux2_project_synthetic_kv` on each layer's updated video features, and caches the resulting synthetic
+K/V. (It also keeps the text and reference K/V separate rather than as one block, because the action
+forward re-assembles the layout per mode.) So the aggregator runs **25 times per chunk**, not 25 times
+per denoising step — the LIT path is a per-chunk cost, and the gate bias is frozen for the chunk too.
+
+The prefill pass is masked with `action_len=0` (`imagewam.py:4178`): the video stream attends to itself,
+exactly as at training time, and never sees the action tokens that do not exist yet.
+
+## 3.2 Micro — the action K/V at inference: the three modes
+
+`_resolve_infer_mode` (`imagewam.py:4238`) answers §2.12's firewall question at deployment. The default
+is read off the checkpoint, not off a flag:
+
+| mode | action K/V layout | available when |
+| --- | --- | --- |
+| `full` | `[txt \| ref \| syn \| action]` | `action_sees_ref=true` — and then it is the default |
+| `firewall` | `[txt \| syn \| action]` | always; the default when the reference channel was never trained |
+| `ref_only` | `[txt \| ref \| action]` | `action_sees_ref=true` |
+
+`IMAGEWAM_INFER_MODE` overrides the default for the ablation numbers. Asking for `full` or `ref_only`
+from a checkpoint trained without the reference channel raises (`imagewam.py:4254`) — it fails closed
+rather than scoring an untrained channel.
+
+The mode is applied in two places that cannot disagree: `build_stage2_action_attention_mask(ref_len=…,
+synthetic_len=…)` (`goal_pose_prior.py:631`) builds the mask — the same function training uses, so
+`ref_len=0` removes the columns rather than masking them, and the prefill cache is stamped with the mode
+(`mot.py:1281`) for the action forward to read back (`mot.py:1315`).
+
+The cold-start gate travels the same route: the bias comes out of the cache and is added to the float
+mask only when it is non-zero (`mot.py:1332`), so an open gate leaves the mask untouched and a closed one
+costs nothing.
+
+## 3.3 Micro — the denoising loop
+
+`build_inference_schedule` (`scheduler_continuous.py:63`) lays down σ from 1 → 0 over
+`num_inference_steps`, warped by the shift (`_phi`, `scheduler_continuous.py:18`); `step` is plain Euler
+(`scheduler_continuous.py:83`). The network is trained to predict velocity (`noise - sample`,
+`scheduler_continuous.py:59`), so each step is `x ← x + v · Δσ` with Δσ < 0:
+
+```text
+   σ:   1.000 ──► 0.978 ──► 0.952 ──► 0.921 ──► ... ──► 0.357 ──► 0.000
+        x_T                                                        action chunk
+        └────────────────────── x ← x + v · Δσ  per step ──────────────┘
+```
+
+Those are the real numbers for `num_inference_steps=10` and the default `shift=5.0`
+(`configs/model/imagewam_flux2_klein_4b_base.yaml:50`) — the shipped LIBERO setting. The shift makes the
+schedule deliberately non-uniform: the early steps creep along near σ≈1 and the last one covers
+0.36 of the range on its own.
+
+Cost is linear in `num_inference_steps` and in nothing else: it is the number of times the 25 action
+blocks run. The video stack does not run again.
+
+## 3.4 Micro — what inference never runs
+
+- **No noisy video target.** Every inference prefill passes `x = empty_target` (`imagewam.py:4151`) with
+  `target_len=0`, so the video expert's `post_dit` and `final_layer` never execute at deploy time and
+  there is no `pred_video`.
+- **Stage 1 needs an oracle goal pose, and nothing supplies one.** `_infer_action_flux2_stage1` raises
+  without `goal_pose` (`imagewam.py:4277`), and the public `infer_action` has no `goal_pose` parameter
+  (`imagewam.py:3607`) — the shipped LIBERO and RoboTwin evaluators can therefore only run baseline and
+  stage-2 checkpoints. Stage 1 is reachable only by calling `infer_action_flux2(goal_pose=…)` directly.
+- **The stage-1 null tokens are training-only.** The 32 learnable `stage1_null_image_tokens` stand in
+  for the missing reference image during training (`imagewam.py:2776`), but the stage-1 *inference* path
+  passes `ref_image_hidden_states=None` (`imagewam.py:4310`) — its prefix is `[txt | pose]` with no
+  image slots at all. A train/deploy difference to know about before scoring stage 1 directly.
+- **`negative_prompt` / `text_cfg_scale` are accepted and then dropped.** `infer_action` takes both
+  (`imagewam.py:3607`); the FLUX.2 branch forwards neither. There is no classifier-free guidance here.
+- **`visualize_future_video` cannot run on FLUX.2.** It calls `infer_joint` (`imagewam.py:3427`), which
+  reads `vae.temporal_downsample_factor` and `vae.upsampling_factor` (`imagewam.py:3502`) — the FLUX.2
+  autoencoder defines neither (see the note in *Where the code lives*). Leave it off.
+
+## 3.5 Micro — the closed loop
+
+`_predict_action_chunk` (`eval_libero_single.py:514`) builds the prompt, passes the **current camera
+frame** as `input_image` — the "ref image" at deployment is the present observation, not a goal — and
+calls `infer_action`. Around it:
+
+- **Denormalization is min/max**, applied per action dim from the processor's normalizer
+  (`eval_libero_single.py:414`) — the stats come from the run's `dataset_stats.json`.
+- **Gripper handling.** The dataloader flips the sign of the gripper dim, so the evaluator flips it back
+  and optionally binarizes it (`eval_libero_single.py:580`).
+- **Receding horizon.** `run_single_episode` (`eval_libero_single.py:600`) waits `num_steps_wait` steps,
+  predicts a chunk, executes `replan_steps` of it open-loop, then re-encodes the fresh observation and
+  replans.
+- **Optional `ActionEnsembler`** (`experiments/libero/action_ensembler.py:5`) averages the overlapping
+  predictions of successive chunks per timestep; off by default.
+
+LIBERO defaults (`configs/sim_libero.yaml`): `action_horizon = num_frames - 1 = 16`, `replan_steps: 10`,
+`num_steps_wait: 30`, `num_inference_steps: ${eval_num_inference_steps} = 10` (`configs/train.yaml:28`),
+`binarize_gripper: true`. RoboTwin drives the same `infer_action` API through
+`experiments/robotwin/imagewam_policy/deploy_policy.py:324`.
+
+## Part 3 — things that are easy to get wrong
+
+- **The inference mode belongs to the checkpoint, not to the command line.** The same eval command
+  scores v2 (`action_sees_ref=true`) as `full` and v1 as `firewall`. `IMAGEWAM_INFER_MODE` only
+  overrides, and requesting a channel the checkpoint never trained raises (`imagewam.py:4254`).
+- **Reported `both` numbers are `full`.** The README's regimes and the code's modes are different
+  vocabularies — `both` ⇔ `full` (the naming trap in *Where the code lives*).
+- **The prefill cache freezes the whole LIT path for the chunk.** Synthetic K/V, gate bias and ref
+  columns are computed once per replan; only the action expert runs again per denoising step.
+- **Two different default step counts.** `infer_action_flux2` defaults to `num_inference_steps=20`
+  (`imagewam.py:4064`) while the shipped sim configs pass 10. Numbers from different step counts are not
+  comparable.
+- **An eval needs the training run's min/max stats.** `DATASET_STATS_PATH` is not optional, and the
+  denormalization is silent about wrong stats.
+
+# Part 4 — building LIT on top of FLUX.2
+
+Parts 1–3 describe what this code *is*. This part describes what it *added*, in the order you would add
+it if you started from stock FLUX.2 knowing nothing about LIT — the reverse-engineering view. Every
+milestone has the same three lines:
+
+```text
+FLUX.2 gives:   what already exists upstream and is not modified
+You add:        the piece with no upstream equivalent
+Check:          the experiment that says the seam is in the right place
+```
+
+The order is a dependency order, not a reading order. M0–M2 are the general-purpose machinery both
+stages share; M3 is stage 1; M4–M5 are stage 2; M6 is training; M7 is deployment.
+
+## 4.0 Build order
+
+```text
+   M0  inventory      FLUX.2 as shipped — read it, change nothing
+        │
+   M1  action expert  a slim FLUX copy: 1024-wide stream, FLUX's 24 × 128 attention
+        │
+   M2  MoT            two experts, one SDPA, split back
+        │
+        ├───────────────────► M3  stage 1: the oracle pose, [txt | pose | action]
+        ▼
+   M4  aggregator     100 latents → synthetic K/V                          (stage 2)
+        │
+   M5  firewall       what the action may see, and how quietly the channel opens
+        │
+   M6  losses         L_video + L_action + L_pose, and the stage1 → stage2 contract
+        │
+   M7  inference      prefill once, denoise N times
+```
+
+| § | milestone | the one-line version |
+| --- | --- | --- |
+| 4.1 | M0 inventory | the seam is in the blocks' private q/k/v split, not in their public API |
+| 4.2 | M1 action expert | clone FLUX's attention geometry, shrink the residual stream to 1024 |
+| 4.3 | M2 MoT | concatenate q/k/v from both experts, one SDPA, split back at `L_v` |
+| 4.4 | M3 stage 1 | encode an oracle pose into 8 tokens and append them to the text stream |
+| 4.5 | M4 vision | 100 recurrent latents produce per-layer synthetic K/V for the action |
+| 4.6 | M5 firewall | the mask decides the channel layout, the gate decides how loud it starts |
+| 4.7 | M6 losses | three losses, a fail-closed checkpoint contract, and rank-safe metrics |
+| 4.8 | M7 inference | hoist the video stream out of the denoising loop |
+
+## 4.1 M0 — what stock FLUX.2 gives you
+
+```text
+FLUX.2 gives:   Flux2.forward, the two block types, EmbedND, Modulation, LastLayer,
+                AutoEncoder, Qwen3Embedder          — model.py:52, model.py:524
+You add:        nothing. This milestone is reading.
+Check:          Flux2(x, x_ids, t, ctx, ctx_ids, guidance) runs unchanged.
+```
+
+```python
+# FLUX.2 as shipped. LIT modifies none of this.            # model.py:115
+class Flux2(nn.Module):
+    def forward(self, x, x_ids, timesteps, ctx, ctx_ids, guidance):
+        vec = self.time_in(timestep_embedding(timesteps, 256))     # model.py:710
+        img, txt = self.img_in(x), self.txt_in(ctx)
+        pe_x, pe_ctx = self.pe_embedder(x_ids), self.pe_embedder(ctx_ids)   # model.py:694
+        for block in self.double_blocks:                           # model.py:524
+            img, txt, _ = block.forward_kv_extract(img, txt, pe_x, pe_ctx, ...)
+        img = cat([txt, img], dim=1)
+        pe = cat([pe_ctx, pe_x], dim=2)
+        for block in self.single_blocks:                           # model.py:437
+            img, _ = block.forward_kv_extract(img, pe, ..., num_txt_tokens)
+        return self.final_layer(img[:, num_txt_tokens:], vec)      # model.py:415
+```
+
+**The decoy.** Upstream already has a caching story: `forward_kv_extract` (`model.py:170`) and
+`forward_kv_cached` (`model.py:267`) run the first step with reference tokens and reuse their K/V on
+later steps, through `causal_attn_fn` (`model.py:758`). It looks like exactly the hook a world–action
+model wants, and LIT **does not use any of it** — that path is causal, single-stream, and for reference
+*images*; LIT needs bidirectional attention between two experts. What the MoT actually calls is one
+level deeper, below the block's public API:
+
+| what you need | where it lives |
+| --- | --- |
+| double block: q/k/v of `[txt \| img]` | `DoubleStreamBlock._prepare_qkv` (`model.py:569`) |
+| double block: the two residual branches | `DoubleStreamBlock._apply_residuals` (`model.py:614`) |
+| single block: q/k/v **and** the fused MLP | `SingleStreamBlock._qkv` (`model.py:468`) |
+| single block: output projection + gate | `SingleStreamBlock._out` (`model.py:482`) |
+
+Those four are what every later milestone builds on. They are private, so a reimplementation should
+plan on vendoring the block rather than importing it.
+
+The other thing to read off at this stage is the id convention (`flux2_video_expert.py:63`,
+`flux2_video_expert.py:75`), because LIT's synthetic tokens need ids that collide with nothing:
+
+| axis 0 (`t`) | axis 1 | axis 2 | axis 3 |
+| --- | --- | --- | --- |
+| 0.0 target image, 10.0 reference image, 2.0 action, **3.0 synthetic** | row | col | text position |
+
+## 4.2 M1 — the action expert
+
+```text
+FLUX.2 gives:   QKNorm, SiLUActivation, MLPEmbedder, Modulation, timestep_embedding,
+                and the block layout to copy   — model.py:375, model.py:390,
+                model.py:683, model.py:400, model.py:746
+You add:        SlimFlux2DoubleBlock, SlimFlux2SingleBlock, Flux2ActionHead,
+                ActionDiTFlux2      — action_dit_flux2.py:30, action_dit_flux2.py:83,
+                action_dit_flux2.py:134, action_dit_flux2.py:146
+Check:          pre_dit → post_dit at zero depth returns [B, T, 7].
+```
+
+The whole design is one decision: **keep FLUX's attention geometry, shrink the residual stream.**
+
+```python
+class ActionDiTFlux2:                                # action_dit_flux2.py:146
+    action_dim, hidden_dim = 7, 1024                 # hidden_dim is the ONE free number
+    num_heads, attn_head_dim = 24, 128               # copied from the video expert, not chosen
+    attn_dim = num_heads * attn_head_dim             # 3072 — width the two experts share
+
+    def pre_dit(self, action, t):                    # action_dit_flux2.py:249
+        tokens = self.action_encoder(action)         # [B, 16, 7] → [B, 16, 1024]
+        vec    = self.time_in(timestep_embedding(t, 256))
+        return dict(tokens=tokens,
+                    ids=build_action_ids(...),       # axis 0 = 2.0      action_dit_flux2.py:237
+                    t_mod=dict(vec=vec,
+                               double_img=self.double_stream_modulation_img(vec),
+                               single=self.single_stream_modulation(vec)[0]))
+
+    def post_dit(self, tokens, pre):                 # action_dit_flux2.py:287
+        return self.head(tokens, pre["t_mod"]["vec"])   # adaLN → Linear(1024 → 7)
+```
+
+Both block types expose the same two-method split, which is what makes M2 a loop instead of a branch:
+
+```python
+class SlimFlux2DoubleBlock:                          # action_dit_flux2.py:30
+    def prepare_qkv(self, x, pe, mod):               # action_dit_flux2.py:52
+        mod1, mod2 = mod
+        x_mod = (1 + mod1.scale) * self.img_norm1(x) + mod1.shift
+        q, k, v = rearrange(self.img_attn.qkv(x_mod), "B L (K H D) -> K B H L D", K=3, H=24)
+        q, k = self.img_attn.norm(q, k, v)           # QKNorm, upstream's class
+        q, k = apply_rope(q, k, pe)                  # model.py:828
+        return dict(q=..., k=..., v=..., residual_x=x, mod2=mod2, mod1_gate=mod1.gate)
+
+    def apply_post(self, mixed_attn_out, state):     # action_dit_flux2.py:75
+        x = state.residual_x + state.mod1_gate * self.img_attn.proj(mixed_attn_out)
+        return x + state.mod2_gate * self.img_mlp(
+            (1 + state.mod2.scale) * self.img_norm2(x) + state.mod2.shift)
+```
+
+The single block fuses the MLP into `linear1` and computes it *before* attention, exactly as
+`SingleStreamBlock` does (§1.6) — that asymmetry between the two block types is inherited, not chosen.
+
+**Initialisation is a separate script, not a `from_pretrained`.** `ActionDiTFlux2.from_pretrained`
+(`action_dit_flux2.py:211`) loads a *pre-converted* checkpoint; producing that checkpoint is
+`preprocess_action_dit_flux2.py`, which copies FLUX.2's img/single branches into the slim blocks by
+name and repairs every shape mismatch:
+
+```python
+def convert(flux2_state, dst_model):                 # preprocess_action_dit_flux2.py:142
+    for name, dst in dst_model.named_parameters():
+        src = flux2_state[name]
+        if src.shape != dst.shape:
+            src = interpolate(src, dst.shape)        # linear along the mismatched axis
+            if src.ndim >= 2 and src.shape[-1] != dst.shape[-1]:
+                src = src * sqrt(src.shape[-1] / dst.shape[-1])   # alpha, preserves variance
+        dst.copy_(src)
+```
+
+## 4.3 M2 — the MoT: two experts, one SDPA
+
+```text
+FLUX.2 gives:   the four block seams from M0
+You add:        MoT: the expert registry, _mixed_attention, one forward per stage
+                — mot.py:22, mot.py:132
+Check:          an empty action stream degenerates to the stock video pass.
+```
+
+Everything works because both experts emit q/k/v of the **same width**, so concatenation needs no
+projection — only the residual streams differ (3072 vs 1024):
+
+```python
+# baseline and stage 1 — one joint SDPA      # mot.py:626, mot.py:670
+def layer(img, txt, action):
+    video_q, video_k, video_v, pe, n_txt, mods = v_block._prepare_qkv(img, txt, pe_x, pe_ctx, ...)
+    video_q, video_k = apply_rope(video_q, video_k, pe)
+    a = a_block.prepare_qkv(action, action_pe, mod)      # [B, L_a, 3072]
+    mixed = sdpa(cat([video_q, a.q], 1),
+                 cat([video_k, a.k], 1),
+                 cat([video_v, a.v], 1), mask)
+    video_out, action_out = split(mixed, [L_v, L_a])
+    img, txt = v_block._apply_residuals(img, txt, *split(video_out, [n_txt, L_img]), mods)
+    return img, txt, a_block.apply_post(action_out, a)
+```
+
+**Stage 2 severs that joint call**, and this is the single most surprising thing in the reverse-engineering
+path. The video stream stops reading the action tokens; the action stream becomes a reader of the video's
+K/V rather than a mutual partner:
+
+```python
+# stage 2 — two separate attentions        # mot.py:863, mot.py:891
+video_attn  = sdpa(video_q, video_k, video_v, video_mask)     # video attends itself only
+action_attn = sdpa(a.q, cat([txt_k | ref_k? | syn_k | a.k]), gated_action_mask)
+```
+
+Nothing in Parts 2–3 would tell you this by looking at the macro diagram — it is visible only in the
+second forward (`mot.py:775`). It also explains §3.1's cache design: because the video stream never
+reads the action stream, prefill can run the video half alone and hand the action half a frozen K/V.
+The action expert is still *trained* in stage 2, but as a consumer.
+
+## 4.4 M3 — the goal-pose interface (stage 1)
+
+```text
+FLUX.2 gives:   txt_in (7680 → 3072), EmbedND, build_txt_ids  — flux2_video_expert.py:63
+You add:        GoalPoseEncoder, _append_goal_tokens_to_flux2_pre,
+                _stage1_null_image_stream
+                — goal_pose_prior.py:85, imagewam.py:2060, imagewam.py:2038
+Check:          prefix length is txt_len + 8, and the 8 pose columns are never masked.
+```
+
+```python
+def stage1_prefix(text, text_mask, pose):            # imagewam.py:2060
+    goal = goal_pose_encoder(pose)                   # [B, 8] → [B, 8, 3072]
+    txt  = cat([text, goal], dim=1)                  # [txt | pose]
+    ids  = build_txt_ids(seq_len=txt.shape[1])       # pose rides axis 3, after the text
+    return txt, pe_embedder(ids), cat([text_mask, ones(B, 8)], dim=1)
+```
+
+The encoder is three linears wide enough to be worth stating exactly — `8 → 512 → 512 → 8·3072`
+(`goal_pose_prior.py:99`), i.e. it emits the FLUX hidden interface directly, not the 7680-D Qwen one.
+The image stream is **empty**, and the two flags that dress it up are both training-only:
+
+```python
+def stage1_loss(sample):                             # imagewam.py:2731
+    x     = zeros(B, 0, 128)                         # no noisy target at all
+    ref   = null_image_tokens.expand(B, -1, -1) or None   # learnable stand-in, image ids, t = 10.0
+    t_vid = train_video_scheduler.sample() if cfg.stage1_sample_video_timestep else zeros(B)
+    pre   = video_expert.pre_dit(x=x, timestep=t_vid, context=txt,
+                                 ref_image_hidden_states=ref, target_img_ids=empty)
+    pre   = append_goal_tokens_to_flux2_pre(pre, pose)
+    mask  = build_mask(txt_len=pre.txt_len, target_len=0,
+                       cond_len=pre.cond_len, action_len=L_a)          # imagewam.py:2312
+    out   = mot(video=pre, action=action_pre, attention_mask=mask)
+    return loss_lambda_action * weighted_mse(action_expert.post_dit(out.action, action_pre), target)
+```
+
+`target_len=0` deletes the target row and column from the mask rather than masking them (§2.5), which
+is what leaves `[txt | pose | action]`.
+
+## 4.5 M4 — the aggregator and the synthetic channel (stage 2)
+
+```text
+FLUX.2 gives:   the per-layer video features (post-attention txt and img) — nothing else
+You add:        SemanticVisualAggregator + SemanticVisualAggregatorGroup,
+                _flux2_update_goal_latents, _flux2_project_synthetic_kv
+                — goal_pose_prior.py:309, goal_pose_prior.py:243,
+                  mot.py:745, mot.py:694
+Check:          the latents differ at every one of the 25 layers; with cond_len = 0 the visual
+                stream is a single masked-out token instead of an empty tensor.
+```
+
+This is the one place where the design is not derivable from FLUX.2 — it is the contribution. The loop
+body, in full:
+
+```python
+def stage2_layer(i, img, txt, action, latents, a_block, v_block):
+    video_attn = sdpa(...)                                   # video, self-only (§4.3)
+    img, txt = v_block._apply_residuals(...)
+
+    latents = aggregator.forward_layer(                      # mot.py:745 — after EVERY block
+        latents,
+        semantic_hidden=txt,                                 # the text tokens
+        visual_hidden=img[:, :cond_len],                     # the REFERENCE image only
+        semantic_mask=text_mask,
+        image_mask=ones(B, cond_len),
+        layer_idx=i, num_layers=25)                          # → group i // 5
+
+    syn_k, syn_v = group.project_kv(latents)                 # [B, 100, 3072]
+    syn_k = rope_on_k_only(syn_k, ids(axis0=3.0, axis1=arange(100)))
+
+    action_attn = sdpa(a.q, cat([txt_k | ref_k? | syn_k | a.k]), gate(action_mask))
+    return img, txt, a_block.apply_post(action_attn, a.state), latents
+```
+
+Two details in that body are easy to get subtly wrong, and both are load-bearing:
+
+- **The residual stream that survives 25 iterations is `latents` alone.** The aggregator is re-run from
+  the updated queries each layer and re-projected through *that layer's* group; nothing else carries
+  across layers. `layer_idx // 5` gives five parameter sets over 25 layers (`goal_pose_prior.py:592`).
+- **The K/V projection order is `to_key → view(…, 128) → RMSNorm → reshape`** (`goal_pose_prior.py:299`),
+  not a norm over the 3072-wide vector. And RoPE is applied to the key with a dummy query
+  (`mot.py:717`) — `apply_rope` needs two arguments, but only `k` is kept.
+
+The group itself is a small transformer over the 100 latents:
+
+```python
+class SemanticVisualAggregatorGroup:                 # goal_pose_prior.py:243
+    def forward(self, queries, semantic, visual, *, semantic_mask, image_mask, visual_attn_mask=None):
+        q = self.self_block(queries)                             # 100 latents attend themselves
+        q = self.semantic_block(q, semantic, semantic_mask)      # cross-attn over txt, padding-masked
+        q = self.visual_block(q, visual, image_mask, visual_attn_mask)   # cross-attn over the ref image
+        return q
+
+    def project_kv(self, tokens):
+        key = self.to_key(tokens).view(B, 100, self.num_kv_heads, 128)
+        key = self.key_norm(key).reshape(B, 100, 3072)           # _RMSNorm over 128
+        return key, self.to_value(tokens)
+```
+
+The 8 pose latents are the ones that carry the training signal — `latents[:, :8]` → `pose_norm` →
+`GoalPoseDecoder` → `L_pose` (§4.7). The other 92 exist only as attention context.
+
+## 4.6 M5 — firewall, regimes, cold-start gate
+
+```text
+FLUX.2 gives:   nothing — pure LIT
+You add:        build_stage2_action_attention_mask, sample_context_keep_mask,
+                sample_channel_regime, _flux2_gate_action_mask
+                — goal_pose_prior.py:631, goal_pose_prior.py:437,
+                  goal_pose_prior.py:478, mot.py:723
+Check:          ref_len = 0 ⇒ key_len == txt_len + syn_len + action_len.
+```
+
+The mask is built by *layout*, not by masking — recalling that a column that does not exist costs
+nothing, while a masked column still costs a softmax slot:
+
+```python
+def action_keep_mask(txt_len, ref_len, syn_len, action_len):     # goal_pose_prior.py:631
+    mask = zeros(B, action_len, txt_len + ref_len + syn_len + action_len, dtype=bool)
+    mask[:, :, :txt_len]                   &= text_mask         # padding columns
+    mask[:, :, ref_cols]                   &= ref_keep          # per-sample, plan B
+    mask[:, :, syn_cols]                   &= syn_keep          # B2 dropout / B2+ blackout
+    mask[:, :, action_cols]                 = True              # the action always sees itself
+    return mask
+```
+
+The gate is the second half of the cold-start story, and it must be **additive on a float mask** — a
+bool mask has nowhere to put a bias:
+
+```python
+def gate(mask, syn_start, bias, span):                           # mot.py:723
+    additive = where(mask, 0.0, -inf)                            # float, not bool
+    lo, hi = span                                                # (8, 100) by default
+    additive[..., syn_start + lo : syn_start + hi] += bias        # only the 92 context columns
+    return additive
+```
+
+`zero_init_value=True` and `gate_pose_tokens=False` are mutually exclusive and the constructor raises
+on the pair (`goal_pose_prior.py:373`): `to_value` is one linear shared by all 100 latents, so zeroing
+it would silence the pose columns the split gate deliberately keeps open.
+
+The regime samplers draw **fixed counts, never independent coins**:
+
+```python
+def sample_channel_regime(B):                                    # goal_pose_prior.py:478
+    n_syn_only = round(p_syn_only * B)                           # 0.30 → no synthetic columns
+    n_ref_only = round(p_ref_only * B)                           # 0.15 → no reference columns
+    order = randperm(B)
+    ref_keep[order[:n_syn_only]] = False
+    syn_keep[order[n_syn_only : n_syn_only + n_ref_only]] = False
+    return ref_keep, syn_keep
+```
+
+The reason is not statistical — it is §M6's metric contract: a coin flip can hand one rank a batch with
+no blackout samples, and `loss_action_fallback` would then be missing on that rank while present on
+another, desynchronising the all-gather. Fixed counts make every regime present in every batch.
+
+## 4.7 M6 — losses, diagnostics, and the stage bridge
+
+```text
+FLUX.2 gives:   nothing; upstream's objective is image-only
+You add:        _training_loss_flux2_{baseline,stage1,stage2}, _goal_prior_diagnostics,
+                validate_goal_prior_checkpoint_keys
+                — imagewam.py:2652, imagewam.py:2731, imagewam.py:2828,
+                  imagewam.py:2971, goal_pose_prior.py:734
+Check:          every rank emits every diagnostic key on every step.
+```
+
+The dispatcher is four lines: `goal_prior_stage` selects the loss (`imagewam.py:2644`).
+
+```python
+def loss_stage2(sample):                                     # imagewam.py:2828
+    inputs = build_inputs_flux2(sample)                       # text, ref, target, action, proprio
+    noise_v, t_v = train_video_scheduler.sample(...)          # independent timesteps per stream
+    noise_a, t_a = train_action_scheduler.sample(...)
+
+    syn_keep  = agg.sample_context_keep_mask(B, device)       # may be None
+    ref_keep, syn_channel_keep = agg.sample_channel_regime(B, device)
+    syn_keep = (syn_keep & syn_channel_keep[:, None]) if syn_channel_keep is not None else syn_keep
+
+    action_mask = build_stage2_action_attention_mask(..., ref_len=cond_len if agg.action_sees_ref else 0)
+    out = mot(video=..., action=..., attention_mask={... "action": action_mask},
+              context_all={"goal_prior": {"aggregator": agg, ...}})
+
+    pred_pose = semantic_visual_pose_decoder(                 # the 8 pose latents only
+        semantic_visual_pose_norm(out.goal_latents[:, :8]))
+    loss = (0.5 * mse(post_dit(out.video), target_video)      # imagewam.py:2952
+          + 1.0 * weighted_action_loss(out.action, target_action)
+          + 0.3 * compute_pose_reconstruction_loss(pred_pose, goal_pose))
+```
+
+The diagnostics are contractual, not decorative — the trainer all-gathers one collective per metric key,
+so a key present on some ranks and absent on others hangs the job:
+
+```python
+def diagnostics(...):                                        # imagewam.py:2971
+    dark = ~syn_keep[:, 8:].any(dim=1)                       # samples that lost the whole context
+    out["gate/bias_mean"]      = mean([g.syn_gate_bias for g in agg.groups])
+    out["blackout_frac"]       = dark.float().mean()
+    out["loss_action_fallback"] = weighted[dark].mean()  if dark.any() else overall
+    out["loss_action_steered"]  = weighted[~dark].mean() if (~dark).any() else overall
+    # every key above is emitted unconditionally, even when the feature is off
+```
+
+The checkpoint contract is the last piece, and it is **fail-closed**: the bridge from stage 1 to stage 2
+permits exactly two kinds of key difference and raises on everything else (`goal_pose_prior.py:734`):
+
+| | keys | why |
+| --- | --- | --- |
+| dropped | `goal_pose_encoder.*`, `stage1_null_image_tokens` | stage 1's prior interface; stage 2 does not read it |
+| randomly initialised | `semantic_visual_aggregator.*`, `semantic_visual_pose_norm.*`, `semantic_visual_pose_decoder.*` | the new vision path — there is nothing to inherit |
+| anything else | — | raises: stage 2 must never silently train from the ActionDiT init |
+
+## 4.8 M7 — inference: prefill once, denoise N times
+
+```text
+FLUX.2 gives:   Flux2.forward (image-only) plus the block seams from M0
+You add:        prefill_flux2_video_cache / prefill_flux2_goal_prior_cache,
+                forward_flux2_action_with_{video,goal_prior}_cache
+                — mot.py:1023, mot.py:1158, mot.py:1080, mot.py:1297
+Check:          the cached prefill reproduces recomputing the video stream every step.
+```
+
+The hoist is the whole idea: the video half depends only on the reference image and the prompt, which
+do not change while the action chunk is being denoised (§4.3 is what makes this legal).
+
+```python
+def infer_chunk(image, prompt):                          # imagewam.py:4360
+    text = qwen3(prompt)                                 # cached embeddings in practice
+    ref, ref_ids = vae_encode(image)                     # one frame → 392 tokens at 1/16
+    pre  = video_expert.pre_dit(x=zeros(B, 0, 128), timestep=0,
+                                ref_image_hidden_states=ref, ...)     # target_len = 0
+    cache = mot.prefill_flux2_goal_prior_cache(pre, ..., goal_prior)  # ONCE per chunk
+    x = randn(B, 16, 7)
+    for t, d_sigma in build_inference_schedule(N):        # scheduler_continuous.py:63
+        a_pre = action_expert.pre_dit(x, t)
+        tok   = mot.forward_flux2_action_with_goal_prior_cache(a_pre, cache, action_mask)
+        x     = x + action_expert.post_dit(tok, a_pre) * d_sigma       # Euler, scheduler:83
+    return x
+```
+
+What the cache holds per layer is worth stating, because it *is* the LIT path's runtime cost model:
+`txt_k/v`, `ref_k/v`, `syn_k/v`, `gate_bias`, `gated_span`, and `mode` (`mot.py:1227`). The aggregator
+therefore runs **25 times per chunk**, not 25 times per step — the synthetic channel and the gate bias
+are frozen for the whole denoising loop, and the only thing that varies across steps is the action
+stream itself.
+
+The inference mode is resolved once and then expressed purely through the two lengths:
+
+```python
+mode = _resolve_infer_mode()                             # imagewam.py:4238
+action_mask = build_stage2_action_attention_mask(
+    synthetic_len = cache["synthetic_len"] if mode in ("full", "firewall") else 0,
+    ref_len       = cond_len               if mode in ("full", "ref_only") else 0)
+```
+
+So `firewall` is literally the same call the firewall-mode *training* makes, and `full` the same call
+plan B makes — deployment re-uses the mask builder rather than re-deriving the layout.
+
+## Part 4 — things that are easy to get wrong
+
+- **Upstream's `forward_kv_extract` is a decoy.** It exists, it caches K/V, and it is the wrong shape
+  for this: causal, single-stream, reference-image-only (`model.py:170`). The seam LIT needs is the
+  private q/k/v split — `_prepare_qkv` / `_apply_residuals` (`model.py:569`, `model.py:614`) and
+  `_qkv` / `_out` (`model.py:468`, `model.py:482`). Expect to vendor the blocks.
+- **Stage 2 is not a superset of stage 1's attention.** Baseline and stage 1 run one joint SDPA over
+  `[video | action]`; stage 2 splits it into two, and the video stream stops reading action entirely
+  (`mot.py:863` vs `mot.py:626`). Anyone re-deriving the architecture from Part 2 alone will get this
+  wrong.
+- **The two experts must agree on head geometry, and the config will not tell you.** `num_heads`,
+  `attn_head_dim` and both layer counts are overwritten from the video expert at construction
+  (`imagewam.py:661`); `hidden_dim` is the only free number.
+- **Only the reference image reaches the aggregator.** `_flux2_update_goal_latents` passes
+  `img[:, :cond_len]` (`mot.py:757`) — the noisy target is sliced away, and at inference there is no
+  target at all.
+- **`key_norm` is per-head, and RoPE applies to the key only.** Viewing to 24 × 128 is part of the
+  norm, not just bookkeeping (`goal_pose_prior.py:299`), and `apply_rope` is called with a dummy query
+  because only `k` survives (`mot.py:717`).
+- **The gate cannot be a bool mask.** It is a learnable logit bias, so the mask has to become an
+  additive float tensor first; `zero_init_value` + an open pose gate is a contradiction the
+  constructor rejects (`goal_pose_prior.py:373`).
+- **Fixed-count sampling is a correctness property, not a statistical one.** Regime counts and blackout
+  counts are drawn so every rank emits every key on every step (`goal_pose_prior.py:478`,
+  `imagewam.py:3003`); switching them to per-sample coins will hang the job rather than skew a metric.
+- **The synthetic time id is 3.0 and it matters.** Synthetic tokens occupy axis 0 = 3.0, distinct from
+  text (axis 3), reference (10.0), target (0.0) and action (2.0) — reusing any of those silently makes
+  the synthetic channel positionally indistinguishable from a real one (`goal_pose_prior.py:617`).
+- **`stage1_null_image_tokens` are training-only.** They stand in for the missing reference during
+  training but not at inference (`imagewam.py:2038` vs `imagewam.py:4310`), so a stage-1 checkpoint
+  should be scored by calling `infer_action_flux2(goal_pose=…)` directly — the shipped evaluators
+  cannot supply one (§3.4).
+
+# Part 5 — training, the original implementation
+
+Parts 1–4 describe the model. This part describes what the training loop actually *optimises* — which is
+not readable off the model, because two separate gates narrow the parameter set and the second is not
+mentioned anywhere near the first.
+
+## 5.0 The two gates
+
+```text
+   trainer.py:543        model.requires_grad_(False)
+        │                     everything, the VAE included
+        ▼
+   trainer.py:545        model.dit.train()  /  requires_grad_(True)
+        │                     dit IS mot — the same object
+        ▼
+   imagewam.py:5364      model.apply_trainable_policy()
+        │                     the flux2-only refinement
+        ▼
+   trainer.py:552        proprio_encoder.requires_grad_(True)
+                              unconditional, in every run type
+```
+
+**Gate 1** is `_apply_dit_only_train_mode` (`trainer.py:541`). It runs *before* the optimiser is built
+(`trainer.py:112` vs `trainer.py:126`) so that ZeRO allocates state over the right tensors, and it is
+re-applied at `train()` entry (`trainer.py:1150`) and again after validation restores the model
+(`trainer.py:1010`) — the whitelist is not a one-time setup.
+
+**Gate 2**, `apply_trainable_policy` (`imagewam.py:5364`), is a no-op for every stack except `flux2`.
+
+What the optimiser actually receives is not a whitelist but the `requires_grad` flag:
+`collect_trainable_parameters` (`imagewam.py:5404`) gathers `dit` + `proprio_encoder` + the goal-prior
+modules and drops anything still frozen (`imagewam.py:5412`). The resulting counts are logged at INFO
+(`trainer.py:484`), grouped by `mot.mixtures.video` / `mot.mixtures.action`
+(`imagewam.py:5421`).
+
+## 5.1 What each run trains
+
+| run | video expert | action expert | LIT modules | proprio encoder |
+| --- | --- | --- | --- | --- |
+| baseline | fully trained | fully trained | — | trained |
+| baseline + LoRA | LoRA only | fully trained | — | trained |
+| stage 1 | frozen (`.eval()`) | fully trained | `goal_pose_encoder` | trained |
+| stage 2 | fully trained | fully trained | aggregator, pose norm, pose decoder | trained |
+
+Two things the table does not show:
+
+- **`proprio_encoder` is trained in all four run types**, including the baselines. Gate 1 re-enables it
+  unconditionally *after* gate 2 has had its say (`trainer.py:552`), and `imagewam.py` never
+  distinguishes.
+- **One optimiser, one param group.** `AdamW(trainable, lr=learning_rate, weight_decay=weight_decay,
+  betas=(0.9, 0.95))` with the betas hardcoded (`trainer.py:126`). There is no per-group learning rate
+  anywhere in the trainer; the only lr knob is the task config (`trainer.py:36`) — `2.0e-4` for stage 1
+  (`configs/task/libero_flux2_klein_4b_goal_prior_stage1.yaml:22`), `1e-4` for stage 2 and the base runs.
+
+Stage 1's freeze is unusual in one respect: the video expert is frozen and in `.eval()`, but it is
+**not** under `no_grad`. All 25 layers still run through autograd because the gradient has to reach
+`goal_pose_encoder` through them — and the checkpointing gate reads `mot.training` (`mot.py:557`), which
+gate 1 sets and `video_expert.eval()` does not clear, so those frozen layers are still
+gradient-checkpointed.
+
+## 5.2 LoRA is baseline-only
+
+LoRA is injected at **construction**, not by the policy: `from_flux2_klein_pretrained` calls
+`apply_lora_to_linear_suffixes(video_expert.transformer, ...)` (`imagewam.py:642`) and records the
+outcome on `video_expert.flux2_lora_enabled` (`imagewam.py:649`). `LoRALinear` freezes its own base in
+its constructor (`lora.py:38`), so the freeze travels with the module rather than with the policy.
+
+`apply_trainable_policy` reaches its LoRA branch only when `goal_prior_stage is None` — both stage
+branches return before it (`imagewam.py:5381`, `imagewam.py:5394`). So switching
+`flux2_lora_config.enabled` on for a goal-prior run builds the modules and then ignores them:
+
+- **stage 1** freezes them along with the rest of the video expert;
+- **stage 2** would call `video_expert.requires_grad_(True)` (`imagewam.py:5385`), unfreezing the LoRA
+  parameters *and* every base weight — the opposite of parameter-efficient.
+
+Reachability is correspondingly narrow. All four flux2 model configs ship `enabled: false`, and the only
+switch exposed to a launcher is `FLUX2_LORA_ENABLED` in an **eval** script, defaulting to false
+(`run_eval_flux2_libero_plus.sh:60`). A LoRA *training* run is reachable only by manual Hydra override
+(`model.flux2_lora_config.enabled=true`), and nothing shipped exercises it.
+
+When it is on, the injected targets are `qkv`, `proj`, `linear1`, `linear2`, `img_mlp.0`, `img_mlp.2`,
+`txt_mlp.0`, `txt_mlp.2` (`configs/model/imagewam_flux2_klein_4b_base.yaml:17`). Loading also has a LoRA
+path: `load_checkpoint` runs the MoT state dict through `merge_lora_state_dict_to_plain` and
+`remap_plain_linear_keys_to_lora_base` before `load_state_dict` (`imagewam.py:5269`), so a plain-key
+checkpoint loads into a LoRA-built model.
+
+## 5.3 What is never trained
+
+- **The VAE.** Built at `imagewam.py:686` and registered as a submodule, so gate 1's blanket freeze
+  reaches it and nothing re-enables it.
+- **The text encoder — which structurally cannot be trained.** The Qwen3 model is wrapped in a
+  `types.SimpleNamespace` rather than an `nn.Module` (`imagewam.py:696`), so its parameters are invisible
+  to `parameters()`, `state_dict()` and `requires_grad_()`; they never reach
+  `collect_trainable_parameters`. Every flux2 config additionally sets `load_text_encoder: false` and
+  reads precomputed embeddings instead.
+- **`stage1_null_image_tokens`.** Despite the name and the config comment, this parameter is **frozen**:
+  it is a bare `nn.Parameter` on the top-level module (`imagewam.py:159`), so gate 1's
+  `model.requires_grad_(False)` reaches it; `model.dit.requires_grad_(True)` (`trainer.py:545`) covers
+  only the MoT subtree; and stage 1's branch of gate 2 re-enables the action expert and the goal encoder
+  only (`imagewam.py:5374`). The `requires_grad` filter in `collect_trainable_parameters`
+  (`imagewam.py:5412`) then drops it from the optimiser. It *is* listed by `goal_prior_parameters()`
+  (`imagewam.py:245`) and *is* saved and restored (`imagewam.py:5242`, `imagewam.py:5330`), so it
+  round-trips through a checkpoint without ever being updated.
+
+## Part 5 — things that are easy to get wrong
+
+- **`stage1_null_image_tokens` is listed but not optimised.** Being present in `goal_prior_parameters()`
+  is not sufficient — the `requires_grad` filter is what decides, and gate 1 has already frozen it. The
+  A2 fix recorded in `CHANGELOG_v2.md:332` covers the listing plus save/load; the filter still excludes
+  it, so the token keeps its `trunc_normal(std=0.02)` initialisation for the whole run. Fixing it means
+  re-enabling it in stage 1's branch, next to `goal_pose_encoder`.
+- **`save_trainable_only: true` produces a checkpoint that cannot be loaded back into a goal-prior
+  run.** It whitelists the MoT subtree only, and a stage-1 run's trainable MoT set is the action expert
+  alone — so the video expert's weights are absent. `load_checkpoint` raises on any missing MoT key when
+  the loading model is in stage 1 or stage 2 (`imagewam.py:5280`). All shipped configs leave it `false`.
+  The same flags do *not* restrict the other modules: `proprio_encoder`, `goal_pose_encoder`,
+  `stage1_null_image_tokens` and the three aggregator modules are always saved in full
+  (`imagewam.py:5241`).
+- **`save_lora_merged: true` with `enabled: false`.** `configs/model/imagewam_flux2_klein_9b_base.yaml`
+  sets the flag at `:22` while disabling LoRA at `:18`. The save path takes the merge branch with no
+  LoRA modules present, so the tensor content is an ordinary full state dict while
+  `checkpoint_format` is tagged `lora_merged` (`imagewam.py:5213`). Nothing in the repo reads that tag
+  back, so it is cosmetic — but it is a lie in the checkpoint metadata.
+- **The checkpointing gate is `mot.training`, not `video_expert.training`** (`mot.py:557`). Stage 1's
+  frozen video layers are therefore still recomputed for backward — that recomputation is required to
+  carry gradient to `goal_pose_encoder`, not an oversight.
+- **Gate 1 runs before the optimiser, so "what trains" is decided once and then re-asserted.** If a run
+  appears to train a module that should be frozen, check `apply_trainable_policy`'s ordering rather than
+  the config — three apply sites (`trainer.py:112`, `:1150`, `:1010`) all call the same policy.

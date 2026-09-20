@@ -44,7 +44,7 @@ COMMON=(
   model.load_text_encoder=true
   model.pack_proprio_after_text=true
   MULTIRUN.num_gpus="${NUM_GPUS:-8}"
-  MULTIRUN.max_tasks_per_gpu="${MAX_TASKS_PER_GPU:-4}"
+  MULTIRUN.max_tasks_per_gpu="${MAX_TASKS_PER_GPU:-2}"
   EVALUATION.action_horizon="${ACTION_HORIZON:-16}"
   EVALUATION.replan_steps="${REPLAN_STEPS:-12}"
 )
