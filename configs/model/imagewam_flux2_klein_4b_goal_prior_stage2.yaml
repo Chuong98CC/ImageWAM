@@ -66,10 +66,25 @@ goal_prior:
   p_ref_only: 0.15    # breaks dependence on the synthetic channel
   p_syn_only: 0.30    # keeps firewall mode trained well enough to report
 
+# --- PEFT-free LoRA on the video expert --------------------------------------
+# `enabled: true` replaces 80 of the video expert's Linear layers with LoRALinear
+# wrappers at construction (imagewam.py:642). Stage 2's branch of
+# `apply_trainable_policy` then freezes the video expert's 3.876B base weights and
+# trains the 23.6M adapters in their place -- see docs/flux2_architecture.md §5.2.
+# The Action Expert and the three LIT aggregator modules stay fully trainable.
+#
+# Stage 2 is the only stage this works in: Stage 1 freezes the video expert
+# wholesale, so adapters built there never move and the policy warns.
+#
+# WARNING: a LoRA-trained checkpoint must be saved merged. The stage-1 bridge and
+# the eval loader rebuild the model WITHOUT adapters, so a run that writes
+# `enabled: true, save_lora_merged: false` produces checkpoints the fail-closed
+# loader rejects. The launcher sets the merge flag for you; if you enable LoRA by
+# hand, set it too.
 flux2_lora_config:
   enabled: false
-  rank: 16
-  alpha: 16.0
+  rank: 16          # adapter params: 11.8M @ 8, 23.6M @ 16, 47.2M @ 32, 94.4M @ 64
+  alpha: 16.0       # scaling is alpha/rank; keep alpha == rank for a scaling of 1.0
   dropout: 0.0
   save_lora_merged: false
   save_trainable_only: false

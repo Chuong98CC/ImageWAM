@@ -50,7 +50,7 @@ DATASET_OVERRIDES=(
 ACTION_INIT="${ACTION_INIT:-checkpoints/action_dit_flux2_${FLUX2_VARIANT}_libero_init.pt}"
 export PYTHONPATH="${REPO_ROOT}/src:${FLUX2_SRC}/src:${FLUX2_SRC}${PYTHONPATH:+:${PYTHONPATH}}"
 
-imagewam_print_config TASK_NAME FLUX2_VARIANT DATA_ROOT FLUX2_SRC FLUX2_MODEL_PATH FLUX2_AE_MODEL_PATH QWEN_CACHE_DIR QWEN_CONTEXT_LEN ACTION_INIT STAGE1_CHECKPOINT TRAIN_NORM_STATS WANDB_MODE
+imagewam_print_config TASK_NAME FLUX2_VARIANT DATA_ROOT FLUX2_SRC FLUX2_MODEL_PATH FLUX2_AE_MODEL_PATH QWEN_CACHE_DIR QWEN_CONTEXT_LEN ACTION_INIT STAGE1_CHECKPOINT TRAIN_NORM_STATS FLUX2_LORA_ENABLED WANDB_MODE
 
 if [ "${REBUILD_ACTION_INIT:-false}" = "true" ] || [ ! -f "${ACTION_INIT}" ]; then
   imagewam_run imagewam_python scripts/flux2/preprocess_action_dit_flux2.py \
@@ -64,6 +64,8 @@ if [ "${REBUILD_ACTION_INIT:-false}" = "true" ] || [ ! -f "${ACTION_INIT}" ]; th
 fi
 
 if [ "${PRECOMPUTE_QWEN3_CACHE}" = "true" ]; then
+  # Builds its own dataset list, so it gets the overrides above rather than the
+  # ones training uses.
   imagewam_run torchrun --standalone --nproc_per_node="${GPU_PER_NODE}" \
     scripts/flux2/precompute_flux2_qwen3_embeds.py \
     task="${TASK_NAME}" \
@@ -77,6 +79,23 @@ if [ "${PRECOMPUTE_QWEN3_CACHE}" = "true" ]; then
     "${DATASET_OVERRIDES[@]}"
 fi
 
+# LoRA on the video expert. Default off: a rank-16 run trains 23.6M adapters in
+# place of the expert's 3.876B base weights, which is a different experiment, not
+# a cheaper copy of the full-fine-tune one. See docs/flux2_architecture.md §5.2.
+FLUX2_LORA_ENABLED="${FLUX2_LORA_ENABLED:-false}"
+LORA_OVERRIDES=(
+  "model.flux2_lora_config.enabled=${FLUX2_LORA_ENABLED}"
+  "model.flux2_lora_config.rank=${FLUX2_LORA_RANK:-16}"
+  "model.flux2_lora_config.alpha=${FLUX2_LORA_ALPHA:-16.0}"
+  "model.flux2_lora_config.dropout=${FLUX2_LORA_DROPOUT:-0.0}"
+)
+if [ "${FLUX2_LORA_ENABLED}" = "true" ]; then
+  # A LoRA checkpoint must be saved merged: the stage-1 bridge and the eval loader
+  # rebuild the model without adapters, and `load_checkpoint` is fail-closed on
+  # missing MoT keys. Forced here so the flag cannot be forgotten.
+  LORA_OVERRIDES+=("model.flux2_lora_config.save_lora_merged=true")
+fi
+
 COMMON_OVERRIDES=(
   "model.flux2_model_path=${FLUX2_MODEL_PATH}"
   "model.ae_model_path=${FLUX2_AE_MODEL_PATH}"
@@ -84,6 +103,7 @@ COMMON_OVERRIDES=(
   "model.action_dit_pretrained_path=${ACTION_INIT}"
   "stage1_checkpoint=${STAGE1_CHECKPOINT}"
   "wandb.mode=offline"
+  "${LORA_OVERRIDES[@]}"
 )
 
 TASK="${TASK_NAME}" imagewam_run bash scripts/flux2/train_flux2_klein_imagewam.sh "${GPU_PER_NODE}" \

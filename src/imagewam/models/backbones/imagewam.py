@@ -737,6 +737,27 @@ class ImageWAM(torch.nn.Module):
         model.flux2_qwen3_model_spec = qwen3_model_spec or default_qwen3_model_spec
         model.save_lora_merged = bool(flux2_lora_config.get("save_lora_merged", bool(flux2_lora_config.get("enabled", False))))
         model.save_trainable_only = bool(flux2_lora_config.get("save_trainable_only", False))
+        if model.save_trainable_only and bool(flux2_lora_config.get("enabled", False)):
+            # Under LoRA the video expert's base weights are frozen, so this filter
+            # would keep the adapters and drop the 3.876B they are applied to --
+            # a checkpoint `load_checkpoint` then rejects for missing MoT keys.
+            raise ValueError(
+                "`flux2_lora_config.save_trainable_only` cannot be combined with "
+                "`flux2_lora_config.enabled`: the frozen base weights would be dropped from "
+                "the checkpoint. Use `save_lora_merged: true` instead."
+            )
+        # Note the resolved value is NOT the check: line above defaults it to True
+        # whenever LoRA is on, so testing that would warn on the correct case and
+        # stay silent on the dangerous one. Only an explicit `false` is a problem.
+        if bool(flux2_lora_config.get("enabled", False)) and not bool(
+            flux2_lora_config.get("save_lora_merged", True)
+        ):
+            logger.warning(
+                "LoRA is enabled with `save_lora_merged: false`. Checkpoints will store the "
+                "full wrapped MoT and will not load into a model built without LoRA (the "
+                "stage-1 bridge and the eval loader). Drop the flag or set it to true unless "
+                "you know the consumer rebuilds the adapters."
+            )
         return model
 
     @classmethod
@@ -5264,10 +5285,27 @@ class ImageWAM(torch.nn.Module):
         if "mot" in payload:
             mot_state = payload["mot"]
             if self.stack == "flux2":
-                from .lora import merge_lora_state_dict_to_plain, remap_plain_linear_keys_to_lora_base
+                from .lora import (
+                    collapse_aliased_transformer_keys,
+                    is_lora_adapter_key,
+                    merge_lora_state_dict_to_plain,
+                    remap_plain_linear_keys_to_lora_base,
+                    strip_mot_prefix,
+                )
 
-                mot_state = merge_lora_state_dict_to_plain(mot_state)
+                # The helpers walk `named_modules()` of the MoT, so the payload has
+                # to be in that frame first -- a `mot.`-prefixed key matches
+                # nothing and is reported missing and unexpected at once.
+                mot_state = strip_mot_prefix(merge_lora_state_dict_to_plain(mot_state))
                 mot_state = remap_plain_linear_keys_to_lora_base(self.mot, mot_state)
+                # `Flux2VideoExpert` binds the FLUX blocks twice, so they appear
+                # under both `…video.transformer.double_blocks.…` and a flattened
+                # `…video.double_blocks.…`. Only the `transformer` form gets the
+                # `.base.` treatment above, so the two halves disagree unless the
+                # flattened keys are folded back -- and both paths are registered,
+                # so leaving either without a value trips the exact-load check.
+                # Runs after the remap so the folded key can see the wrapped name.
+                mot_state = collapse_aliased_transformer_keys(self.mot, mot_state)
             load_result = self.mot.load_state_dict(mot_state, strict=False)
             missing_keys = list(load_result.missing_keys)
             unexpected_keys = list(load_result.unexpected_keys)
@@ -5277,10 +5315,28 @@ class ImageWAM(torch.nn.Module):
                 len(unexpected_keys),
             )
             if current_stage in {"stage1", "stage2"}:
-                if missing_keys or unexpected_keys:
+                # LoRA adapters are stage-2-only: a stage-2 run wraps the video
+                # expert and loads a stage-1 payload that predates the wrappers, so
+                # `lora_A`/`lora_B` are absent by construction and are initialised
+                # here rather than inherited. That is the same situation as the
+                # aggregator modules, so they are allowed to go missing on the
+                # bridge -- but only on the bridge, and only those keys.
+                bridge_from_stage1 = bool(
+                    goal_prior_bridge or (current_stage == "stage2" and payload_stage == "stage1")
+                )
+                inherited_missing = missing_keys
+                if bridge_from_stage1:
+                    inherited_missing = [k for k in missing_keys if not is_lora_adapter_key(k)]
+                    if len(inherited_missing) != len(missing_keys):
+                        logger.info(
+                            "Stage 2 LoRA bridge: %d adapter tensors initialised fresh "
+                            "(a stage-1 payload carries none).",
+                            len(missing_keys) - len(inherited_missing),
+                        )
+                if inherited_missing or unexpected_keys:
                     raise RuntimeError(
                         "Goal-prior MoT load must be exact for ActionDiT/FLUX weights. "
-                        f"missing={missing_keys[:20]} unexpected={unexpected_keys[:20]}"
+                        f"missing={inherited_missing[:20]} unexpected={unexpected_keys[:20]}"
                     )
             else:
                 if missing_keys:
@@ -5361,12 +5417,42 @@ class ImageWAM(torch.nn.Module):
             optimizer.load_state_dict(payload["optimizer"])
         return payload
 
+    @staticmethod
+    def _expert_lora_enabled(expert) -> bool:
+        """Whether LoRA adapters were injected into this expert at construction."""
+        return expert is not None and bool(getattr(expert, "flux2_lora_enabled", False))
+
+    @staticmethod
+    def _apply_expert_lora_freeze(expert: nn.Module) -> int:
+        """Freeze every weight in `expert`, then re-enable only its LoRA adapters.
+
+        The base weights are already frozen by `LoRALinear.__init__`; re-freezing
+        here keeps the policy self-contained and covers any parameter the wrapper
+        did not reach. Returns the number of adapter tensors it left trainable.
+        """
+        expert.train()
+        for param in expert.parameters():
+            param.requires_grad = False
+        trainable = 0
+        for name, param in expert.named_parameters():
+            if ".lora_A" in name or ".lora_B" in name:
+                param.requires_grad = True
+                trainable += 1
+        return trainable
+
     def apply_trainable_policy(self) -> None:
-        """Refine trainer's default DiT-only policy for parameter-efficient modes."""
+        """Refine trainer's default DiT-only policy for parameter-efficient modes.
+
+        Precedence per stage: for the goal-prior stages the video expert is either
+        frozen outright (stage 1) or fully trainable (stage 2), and only Stage 2 has
+        a LoRA variant -- adapters train in place of the base weights. The baseline
+        (`goal_prior_stage is None`) reads its LoRA switch off the expert.
+        """
         if self.stack != "flux2":
             return
         video_expert = self.mot.mixtures["video"] if "video" in self.mot.mixtures else None
         action_expert = self.mot.mixtures["action"] if "action" in self.mot.mixtures else None
+        lora_enabled = self._expert_lora_enabled(video_expert)
         if action_expert is not None:
             action_expert.train()
             action_expert.requires_grad_(True)
@@ -5375,14 +5461,34 @@ class ImageWAM(torch.nn.Module):
             if video_expert is not None:
                 video_expert.eval()
                 video_expert.requires_grad_(False)
+            if lora_enabled:
+                # Stage 1 freezes the video expert wholesale -- the gradient that
+                # reaches `goal_pose_encoder` travels through activations, not
+                # weights. Adapters built here can never move, so say so rather
+                # than leaving a run that looks parameter-efficient and is not.
+                logger.warning(
+                    "flux2_lora_config.enabled is set on a %s run: Stage 1 freezes the whole "
+                    "video expert, so the LoRA adapters will never train. Disable it for "
+                    "Stage 1 and enable it on Stage 2 instead.",
+                    stage,
+                )
             if self.goal_pose_encoder is not None:
                 self.goal_pose_encoder.train()
                 self.goal_pose_encoder.requires_grad_(True)
             return
         if stage == "stage2":
             if video_expert is not None:
-                video_expert.train()
-                video_expert.requires_grad_(True)
+                if lora_enabled:
+                    adapters = self._apply_expert_lora_freeze(video_expert)
+                    logger.info(
+                        "Stage 2 LoRA policy: video expert base weights frozen, "
+                        "%d adapter tensors trainable (targets=%s).",
+                        adapters,
+                        getattr(video_expert, "flux2_lora_target_suffixes", ()),
+                    )
+                else:
+                    video_expert.train()
+                    video_expert.requires_grad_(True)
             for module in (
                 self.semantic_visual_aggregator,
                 self.semantic_visual_pose_norm,
@@ -5392,14 +5498,9 @@ class ImageWAM(torch.nn.Module):
                     module.train()
                     module.requires_grad_(True)
             return
-        if video_expert is None or not bool(getattr(video_expert, "flux2_lora_enabled", False)):
+        if not lora_enabled:
             return
-        video_expert.train()
-        for param in video_expert.parameters():
-            param.requires_grad = False
-        for name, param in video_expert.named_parameters():
-            if ".lora_A" in name or ".lora_B" in name:
-                param.requires_grad = True
+        self._apply_expert_lora_freeze(video_expert)
 
     def collect_trainable_parameters(self):
         seen: set[int] = set()

@@ -1763,13 +1763,19 @@ For the same reason the constructor **rejects** `save_trainable_only` together w
 policy the base weights are frozen, so that filter would keep the adapters and drop the 3.876B they are
 applied to.
 
-Loading runs the MoT state dict through three steps before `load_state_dict`
-(`imagewam.py:5287`): `merge_lora_state_dict_to_plain`, `drop_aliased_transformer_keys`, then
-`remap_plain_linear_keys_to_lora_base`. A plain-key checkpoint loads into a LoRA-built model, and a
-merged payload loads into either.
+Loading runs the MoT state dict through four steps before `load_state_dict`
+(`imagewam.py:5299`). A plain-key checkpoint loads into a LoRA-built model, and a merged payload loads
+into either.
 
-The alias step is the one that bites. `Flux2VideoExpert` binds the FLUX.2 blocks **twice**
-(`flux2_video_expert.py:22`):
+| Step | Why |
+| --- | --- |
+| `merge_lora_state_dict_to_plain` | Folds an *unmerged* payload's adapters into base weights, so both checkpoint flavours read the same. |
+| `strip_mot_prefix` | The payload is `self.mot.state_dict()`, but called on the expert those keys come back without the leading `mot.`. The helpers below derive names from `named_modules()`, so a prefixed payload matches nothing and every key is reported missing *and* unexpected. |
+| `remap_plain_linear_keys_to_lora_base` | Renames a plain `….qkv.weight` to the wrapper's `….qkv.base.weight`. |
+| `collapse_aliased_transformer_keys` | The alias problem below. |
+
+The alias step is the one that bites, and it only exists because of how the video expert is built. It
+binds the FLUX.2 blocks **twice** (`flux2_video_expert.py:22`):
 
 ```python
 self.transformer = transformer
@@ -1778,11 +1784,21 @@ self.double_blocks = transformer.double_blocks   # flattened alias onto the expe
 
 so a LoRA-built MoT state dict lists every block weight under both `…video.transformer.double_blocks.…`
 and `…video.double_blocks.…`. The adapters live only on the `transformer` path, so the remap rewrites
-that key and leaves its alias twin unmapped — one missing plus one unexpected key per block, which the
-exact-load check rejects outright. Before LoRA this was invisible: plain keys found a home under either
-path, so the duplicate never mattered. `drop_aliased_transformer_keys` removes the alias copies, and only
-when the `transformer` twin is present in the same dict — the aliasing condition itself, so it is a no-op
-on module trees without the duplicate binding.
+that key and leaves its alias twin unmapped — the two halves then disagree, and because
+`load_state_dict` walks each registered path separately it reports one missing plus one unexpected key
+per block and the exact-load check rejects the load outright. Before LoRA this was invisible: plain keys
+found a home under either path, so the duplicate never mattered.
+
+`collapse_aliased_transformer_keys` repopulates both paths from the wrapped value, which is canonical —
+it owns the adapters and the merged base weights — and drops any key that addresses no registered
+parameter. Two consequences worth knowing:
+
+- **The same bug lives on the save side.** `lora_merged_state_dict` walks the module state dict, so an
+  un-collapsed save writes each block weight a second time under the flattened name.
+- **`lora_A`/`lora_B` are parameters *of* the `LoRALinear`**, not children under a submodule, so the
+  prefix filter that skips wrapped modules does not skip them. Without an explicit guard a checkpoint
+  tagged `lora_merged` also carries the raw adapters — visible as `lora_*` and `.base.*` counts of the
+  same size in a saved payload.
 
 **Costs to weigh before enabling it.** Freezing the expert removes its ability to adapt to the LIT
 regime: Stage 2's `0.5 · L_video` currently tunes the FLUX backbone to the goal-prior setup, and under
