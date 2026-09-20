@@ -67,7 +67,9 @@ git clone https://github.com/NVlabs/curobo.git
 cd curobo
 git fetch --tags
 git checkout v0.7.8
-MAX_JOBS=192 CMAKE_BUILD_PARALLEL_LEVEL=192 uv pip install -e . --no-build-isolation
+# Capped from the upstream 192: these are literal assignments, so exporting cannot override
+# them, and 192 parallel compiles oversubscribes smaller build hosts into an OOM.
+MAX_JOBS=16 CMAKE_BUILD_PARALLEL_LEVEL=16 uv pip install -e . --no-build-isolation
 cd ../..
 
 echo "Installation basic environment complete!"

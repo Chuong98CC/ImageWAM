@@ -77,6 +77,31 @@ STAGE1_CHECKPOINT=/path/to/stage1/checkpoints/weights/step_010000.pt \
   bash scripts/flux2/run_train_flux2_klein_goal_prior_stage2.sh
 ```
 
+Stage2 + 视频专家 LoRA（可选，**默认关闭**）：
+
+```bash
+STAGE1_CHECKPOINT=/path/to/stage1/checkpoints/weights/step_010000.pt \
+FLUX2_LORA_ENABLED=true FLUX2_LORA_RANK=16 \
+  bash scripts/flux2/run_train_flux2_klein_goal_prior_stage2.sh
+```
+
+打开后冻结视频专家的 3.876B 底座权重，只训练 80 个 Linear 上的低秩适配器（rank16 ≈ 23.6M，
+占该专家 2.36%）；Action Expert 与三个聚合器模块仍全量训练。rank/alpha/dropout 见
+`FLUX2_LORA_RANK`、`FLUX2_LORA_ALPHA`、`FLUX2_LORA_DROPOUT`。
+
+两点硬约束：
+
+- **只有 Stage2 支持**。Stage1 整个视频专家都被冻结（梯度经激活回传到 `goal_pose_encoder`，
+  不经权重），适配器永远不会更新；脚本此时会打 warning，不要开。
+- **必须合并保存**。`FLUX2_LORA_ENABLED=true` 时启动脚本自动追加
+  `model.flux2_lora_config.save_lora_merged=true`。若手工用 Hydra override 开启 LoRA 而忘了这个
+  开关，写出的 checkpoint 键名带 `base_layer` 且体积翻倍，Stage1→Stage2 桥接与评测加载器都会
+  拒绝加载。
+
+注意这**不是**同一次实验的省显存版本：视频专家不再能适应 LIT 训练域，Stage2 的
+`0.5 · L_video` 从全量微调退化为每 block 八个投影族的 rank-16 修正。见
+`docs/flux2_architecture.md` §5.2。
+
 常用 Hydra override：
 
 - `batch_size=`

@@ -15,15 +15,20 @@ imagewam_init() {
     set +a
   fi
 
-  # TorchCodec dlopen needs CUDA 11 NPP from the pip nvidia-npp wheel.
-  local _npp_lib
-  for _npp_lib in "${REPO_ROOT}/.venv"/lib/python*/site-packages/nvidia/npp/lib; do
-    if [ -d "${_npp_lib}" ]; then
-      case ":${LD_LIBRARY_PATH:-}:" in
-        *":${_npp_lib}:"*) ;;
-        *) export LD_LIBRARY_PATH="${_npp_lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ;;
-      esac
-    fi
+  # TorchCodec's dlopen wants CUDA NPP: libtorchcodec_core*.so links libnppicc.so.12,
+  # which presently resolves from the system CUDA toolkit via ldconfig -- no venv here
+  # ships an nvidia/npp wheel, so this loop is normally a no-op. Probe both venvs so it
+  # keeps working if a lock change ever adds one (RoboTwin eval runs from .venv_rb2).
+  local _venv _npp_lib
+  for _venv in "${REPO_ROOT}/.venv" "${ROBOTWIN_VENV:-${REPO_ROOT}/.venv_rb2}"; do
+    for _npp_lib in "${_venv}"/lib/python*/site-packages/nvidia/npp/lib; do
+      if [ -d "${_npp_lib}" ]; then
+        case ":${LD_LIBRARY_PATH:-}:" in
+          *":${_npp_lib}:"*) ;;
+          *) export LD_LIBRARY_PATH="${_npp_lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ;;
+        esac
+      fi
+    done
   done
 }
 
@@ -66,6 +71,23 @@ imagewam_activate_env() {
 
 imagewam_python() {
   "${PYTHON_BIN:-python}" "$@"
+}
+
+# Switch to the RoboTwin evaluation venv (built by scripts/setup/install_robotwin_env.sh).
+# Activation is load-bearing, not cosmetic: `uv pip` inside RoboTwin's own scripts takes its
+# target from VIRTUAL_ENV, and without it uv walks up from third_party/RoboTwin and finds the
+# main .venv -- which is what used to rewrite .venv's pinned versions.
+imagewam_robotwin_env() {
+  local venv="${ROBOTWIN_VENV:-${REPO_ROOT}/.venv_rb2}"
+  if [ ! -x "${venv}/bin/python" ]; then
+    echo "RoboTwin venv not found at ${venv}" >&2
+    echo "Run scripts/setup/install_robotwin_env.sh, or point ROBOTWIN_VENV at one." >&2
+    exit 2
+  fi
+  # shellcheck disable=SC1091
+  source "${venv}/bin/activate"
+  PYTHON_BIN="${venv}/bin/python"
+  export PYTHON_BIN
 }
 
 imagewam_ckpt_from_exp() {

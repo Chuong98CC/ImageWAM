@@ -5,6 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../common.sh
 source "${SCRIPT_DIR}/../common.sh"
 imagewam_init "${SCRIPT_DIR}/../.."
+# RoboTwin's simulator deps (sapien/mplib/curobo) are unpinned and would downgrade .venv's
+# pins, so this eval runs from the dedicated env built by install_robotwin_env.sh. Must come
+# after imagewam_init, which sources .env.local with `set -a` and would clobber PYTHON_BIN.
+imagewam_robotwin_env
 
 SUITE="robotwin"
 CONFIG_NAME="sim_robotwin"
@@ -61,5 +65,5 @@ COMMON+=(
   EVALUATION.robotwin_camera_layout="${ROBOTWIN_CAMERA_LAYOUT:-compact_288x256}"
 )
 
-imagewam_print_config SUITE TASK CKPT_PATH DATASET_STATS_PATH FLUX2_SRC FLUX2_MODEL_PATH FLUX2_AE_MODEL_PATH
+imagewam_print_config SUITE TASK CKPT_PATH DATASET_STATS_PATH FLUX2_SRC FLUX2_MODEL_PATH FLUX2_AE_MODEL_PATH ROBOTWIN_VENV
 imagewam_run imagewam_python experiments/robotwin/run_robotwin_manager.py "${COMMON[@]}" "$@"

@@ -8,6 +8,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../common.sh
 source "${SCRIPT_DIR}/../common.sh"
 imagewam_init "${SCRIPT_DIR}/../.."
+# See run_eval_flux2_robotwin.sh: RoboTwin eval runs from the dedicated env.
+imagewam_robotwin_env
 
 CONFIG_NAME="sim_robotwin"
 TASK="${EE16_TASK:-robotwin_flux2_klein_4b_base_clean_imagewam_ee16}"
@@ -61,5 +63,5 @@ fi
 
 imagewam_print_config \
   TASK CKPT_PATH DATASET_STATS_PATH FLUX2_SRC FLUX2_MODEL_PATH \
-  FLUX2_AE_MODEL_PATH FLUX2_QWEN3_MODEL_SPEC
+  FLUX2_AE_MODEL_PATH FLUX2_QWEN3_MODEL_SPEC ROBOTWIN_VENV
 imagewam_run imagewam_python experiments/robotwin/run_robotwin_manager.py "${COMMON[@]}" "$@"

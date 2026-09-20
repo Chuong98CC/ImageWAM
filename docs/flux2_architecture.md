@@ -128,6 +128,40 @@ The variants differ only in these numbers (`model.py:11`, `model.py:25`, `model.
 
 Only the 4B and 9B Klein variants are accepted (`flux2_video_expert.py:49`).
 
+### 1.0.1 Parameter counts (Klein 4B)
+
+Measured, not estimated: the `Flux2(Klein4BParams())` build on the meta device reproduces the shipped
+safetensors tensor-for-tensor, and both agree to the parameter.
+
+| Component | Params | Share | Role |
+| --- | ---: | ---: | --- |
+| **Transformer** (`flux-2-klein-base-4b.safetensors`) | **3,875,544,576** | 48.6% | the "4B" |
+| **Text encoder** (`Qwen3ForCausalLM`) | **4,022,468,096** | 50.4% | LLM, hidden 2560 |
+| **VAE** (`AutoencoderKLFlux2`) | **84,046,375** | 1.1% | image ↔ latent |
+| **Total** | **7,982,059,047** | | |
+
+The "4B" name counts the **transformer alone** — the released pipeline is ~8B. Note also that
+`model_index.json` lists only `scheduler, text_encoder, tokenizer, transformer, vae`: there is **no
+vision tower**. The text encoder is `Qwen3ForCausalLM`, a text-only LLM, and images enter through the
+84M VAE. The `4B/8B` label in the diagram above is the text encoder's own size, not a vision model's.
+
+Inside the transformer, the single blocks dominate:
+
+| Group | Params | Share of transformer |
+| --- | ---: | ---: |
+| `single_blocks` (×20) | 2,453,672,960 | 63.3% |
+| `double_blocks` (×5) | 1,226,836,480 | 31.7% |
+| `double_stream_modulation_img` | 56,623,104 | 1.5% |
+| `double_stream_modulation_txt` | 56,623,104 | 1.5% |
+| `single_stream_modulation` | 28,311,552 | 0.7% |
+| `txt_in` | 23,592,960 | 0.6% |
+| `final_layer` | 19,267,584 | 0.5% |
+| `time_in` | 10,223,616 | 0.3% |
+| `img_in` | 393,216 | 0.01% |
+
+A single block is 122.7M of that: `linear1` is (27648, 3072) — a ~9× combined attention + both-MLP
+expansion, not the `mlp_ratio` you would guess from the config — and `linear2` is (3072, 12288).
+
 ## 1.1 Micro — VAE (`autoencoder.py:271`)
 
 4-level conv autoencoder, `z_channels=32`, `ch_mult=[1,2,4,4]`, `ps=[2,2]`. `encode` takes the mean of
@@ -418,6 +452,39 @@ What is trainable (`apply_trainable_policy`, `imagewam.py:5364`):
 
 Stage 2 and the baseline use the same two gates with different whitelists, and LoRA is a third
 path reachable only from the baseline — Part 5 covers all of them.
+
+### 2.1.1 The instantiated FLUX.2 stack
+
+Every module `ImageWAM` actually materialises on the 4B Klein path, measured by building each class on
+the meta device with the shipped config (`configs/model/imagewam_flux2_klein_4b_goal_prior_stage2.yaml`):
+
+| Module | Params | Share of stack | Stage 2 status |
+| --- | ---: | ---: | --- |
+| Video Expert — the Part 1 transformer, unmodified | 3,875,544,576 | 81.0% | trainable (LoRA-able, §5.2) |
+| Action Expert (`ActionDiTFlux2`) | 642,012,416 | 13.4% | trainable |
+| `SemanticVisualAggregator` | 165,439,365 | 3.5% | trainable |
+| VAE (`AutoencoderKLFlux2`) | 84,046,375 | 1.8% | frozen, `.eval()` |
+| `GoalPoseEncoder` | 12,874,752 | 0.27% | stage 1 only |
+| `semantic_visual_pose_decoder` (`GoalPoseDecoder`) | 3,413,000 | 0.07% | trainable |
+| `semantic_visual_pose_norm` (`LayerNorm(768)`) | 1,536 | 0.00003% | trainable |
+| `ProprioEncoder` (`Linear(8 → 7680)`) | 61,448 | 0.001% | trainable |
+| **In-process total** | **4,783,393,468** | | |
+
+Names are the checkpoint payload keys; `GoalPoseDecoder` *is* `semantic_visual_pose_decoder`
+(`imagewam.py:217`), not a separate module, and the two are saved under the latter
+(`imagewam.py:5246`).
+
+The Qwen3-4B text encoder (4.02B, §1.0.1) is **not** in this table because it is never instantiated:
+every flux2 config sets `load_text_encoder: false` and reads precomputed embeddings from the Qwen cache
+(`imagewam.py:701`). Counting it, the nominal pipeline is ~8.8B.
+
+Two things this makes concrete:
+
+- The Action Expert is **642M, not a small head**. Its residual stream is 1024-wide but its attention
+  geometry is 24 × 128 = 3072 to match the video expert, so the attention projections dominate its
+  parameter count. It is 6× the aggregator and the second-largest module here.
+- The aggregator is **165M** — 3.5% of the stack. At LoRA rank 16 the FLUX adapters are 23.6M
+  (§5.2), so the LIT modules beside them are 7× larger and train in full.
 
 Loss: `1.0 · L_action`, nothing else. No image loss and no pose loss exist in this stage.
 
@@ -1648,31 +1715,80 @@ Stage 1's freeze is unusual in one respect: the video expert is frozen and in `.
 gate 1 sets and `video_expert.eval()` does not clear, so those frozen layers are still
 gradient-checkpointed.
 
-## 5.2 LoRA is baseline-only
+## 5.2 LoRA on the video expert
 
 LoRA is injected at **construction**, not by the policy: `from_flux2_klein_pretrained` calls
 `apply_lora_to_linear_suffixes(video_expert.transformer, ...)` (`imagewam.py:642`) and records the
 outcome on `video_expert.flux2_lora_enabled` (`imagewam.py:649`). `LoRALinear` freezes its own base in
 its constructor (`lora.py:38`), so the freeze travels with the module rather than with the policy.
 
-`apply_trainable_policy` reaches its LoRA branch only when `goal_prior_stage is None` — both stage
-branches return before it (`imagewam.py:5381`, `imagewam.py:5394`). So switching
-`flux2_lora_config.enabled` on for a goal-prior run builds the modules and then ignores them:
+**Which stage may use it.** Stage 2 only. `apply_trainable_policy` keeps its LoRA branch for the
+baseline, and gives Stage 2 a LoRA variant beside the full-fine-tune one (`imagewam.py:5403`):
 
-- **stage 1** freezes them along with the rest of the video expert;
-- **stage 2** would call `video_expert.requires_grad_(True)` (`imagewam.py:5385`), unfreezing the LoRA
-  parameters *and* every base weight — the opposite of parameter-efficient.
+| Run | video expert |
+| --- | --- |
+| baseline, LoRA off | fully trainable |
+| baseline, LoRA on | base frozen, adapters trainable |
+| **stage 1** | fully frozen — LoRA or not |
+| **stage 2**, LoRA off | fully trainable (the evaluated revision) |
+| **stage 2**, LoRA on | **base frozen, adapters trainable** |
 
-Reachability is correspondingly narrow. All four flux2 model configs ship `enabled: false`, and the only
-switch exposed to a launcher is `FLUX2_LORA_ENABLED` in an **eval** script, defaulting to false
-(`run_eval_flux2_libero_plus.sh:60`). A LoRA *training* run is reachable only by manual Hydra override
-(`model.flux2_lora_config.enabled=true`), and nothing shipped exercises it.
+Stage 1 cannot use it, and the policy logs a warning when `enabled` is set there: the stage freezes the
+whole video expert because the gradient that reaches `goal_pose_encoder` travels through activations,
+not weights — so adapters built for a Stage 1 run would never move.
 
-When it is on, the injected targets are `qkv`, `proj`, `linear1`, `linear2`, `img_mlp.0`, `img_mlp.2`,
-`txt_mlp.0`, `txt_mlp.2` (`configs/model/imagewam_flux2_klein_4b_base.yaml:17`). Loading also has a LoRA
-path: `load_checkpoint` runs the MoT state dict through `merge_lora_state_dict_to_plain` and
-`remap_plain_linear_keys_to_lora_base` before `load_state_dict` (`imagewam.py:5269`), so a plain-key
-checkpoint loads into a LoRA-built model.
+**What it trains.** The shipped `target_suffixes` hit **80 Linear layers** holding **3,774.9M** of the
+expert's 3,875.5M (97.4%), with the adapter cost set by rank alone (bf16, on disk):
+
+| rank | adapter params | % of video expert | file |
+| ---: | ---: | ---: | ---: |
+| 8 | 11.80M | 1.18% | 24 MB |
+| **16** (default) | **23.59M** | **2.36%** | 47 MB |
+| 32 | 47.19M | 4.72% | 94 MB |
+| 64 | 94.37M | 9.44% | 189 MB |
+
+Scaling is `alpha/rank`; the configs ship `alpha == rank` for a scaling of 1.0. For scale, the 23.6M
+rank-16 adapter is *smaller than the 165M `SemanticVisualAggregator` training beside it* (§2.1.1).
+Targets are `qkv`, `proj`, `linear1`, `linear2`, `img_mlp.0`, `img_mlp.2`, `txt_mlp.0`, `txt_mlp.2`
+(`configs/model/imagewam_flux2_klein_4b_base.yaml:17`).
+
+**Saving is the sharp edge.** A LoRA-trained checkpoint **must** be saved merged
+(`save_lora_merged: true`), because the stage-1 bridge and the eval loader rebuild the model *without*
+adapters and `load_checkpoint` is fail-closed on missing MoT keys (`imagewam.py:5280`). The launcher
+sets the flag whenever `FLUX2_LORA_ENABLED=true`; enabling LoRA by hand in a YAML does not, and the
+constructor warns. Saving *unmerged* also renames every key (`base_layer.weight`) and roughly doubles
+the payload with frozen base weights, which nothing in the repo reads back.
+
+For the same reason the constructor **rejects** `save_trainable_only` together with LoRA: under the LoRA
+policy the base weights are frozen, so that filter would keep the adapters and drop the 3.876B they are
+applied to.
+
+Loading runs the MoT state dict through three steps before `load_state_dict`
+(`imagewam.py:5287`): `merge_lora_state_dict_to_plain`, `drop_aliased_transformer_keys`, then
+`remap_plain_linear_keys_to_lora_base`. A plain-key checkpoint loads into a LoRA-built model, and a
+merged payload loads into either.
+
+The alias step is the one that bites. `Flux2VideoExpert` binds the FLUX.2 blocks **twice**
+(`flux2_video_expert.py:22`):
+
+```python
+self.transformer = transformer
+self.double_blocks = transformer.double_blocks   # flattened alias onto the expert
+```
+
+so a LoRA-built MoT state dict lists every block weight under both `…video.transformer.double_blocks.…`
+and `…video.double_blocks.…`. The adapters live only on the `transformer` path, so the remap rewrites
+that key and leaves its alias twin unmapped — one missing plus one unexpected key per block, which the
+exact-load check rejects outright. Before LoRA this was invisible: plain keys found a home under either
+path, so the duplicate never mattered. `drop_aliased_transformer_keys` removes the alias copies, and only
+when the `transformer` twin is present in the same dict — the aliasing condition itself, so it is a no-op
+on module trees without the duplicate binding.
+
+**Costs to weigh before enabling it.** Freezing the expert removes its ability to adapt to the LIT
+regime: Stage 2's `0.5 · L_video` currently tunes the FLUX backbone to the goal-prior setup, and under
+LoRA that becomes a rank-16 edit to eight projection families per block. The modulation projections
+(`double_stream_modulation_img/txt`, `single_stream_modulation`, 141.6M total) and `final_layer` are
+**not** targeted, so the timestep conditioning and output head stay frozen outright.
 
 ## 5.3 What is never trained
 
@@ -1705,7 +1821,13 @@ checkpoint loads into a LoRA-built model.
   the loading model is in stage 1 or stage 2 (`imagewam.py:5280`). All shipped configs leave it `false`.
   The same flags do *not* restrict the other modules: `proprio_encoder`, `goal_pose_encoder`,
   `stage1_null_image_tokens` and the three aggregator modules are always saved in full
-  (`imagewam.py:5241`).
+  (`imagewam.py:5241`). Combining it with `flux2_lora_config.enabled` is worse still — under the LoRA
+  policy the base weights are frozen, so the filter keeps the adapters and drops the 3.876B they apply
+  to. The constructor now raises on that combination (`imagewam.py:740`) rather than writing it out.
+- **Enabling LoRA without `save_lora_merged` writes checkpoints nothing can read.** The payload keeps
+  the wrapped module names (`*.base_layer.weight`) and carries every frozen base weight, so it roughly
+  doubles in size and still fails the fail-closed MoT load. The constructor warns; the launcher forces
+  the flag; a hand-written Hydra override does neither.
 - **`save_lora_merged: true` with `enabled: false`.** `configs/model/imagewam_flux2_klein_9b_base.yaml`
   sets the flag at `:22` while disabling LoRA at `:18`. The save path takes the merge branch with no
   LoRA modules present, so the tensor content is an ordinary full state dict while

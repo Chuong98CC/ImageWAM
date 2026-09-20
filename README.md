@@ -77,6 +77,13 @@ Then evaluate `<stage2_run>/checkpoints/weights/step_034720.pt` with `<stage2_ru
 exactly as in §1 (the released `lit_stage2/model.pt` is that file, renamed; 34,720 steps = 10 epochs).
 `scripts/audit_goal_prior_v2.py` checks a Stage-2 run's latent usage before you trust it.
 
+Stage 2 can instead train the FLUX.2 video expert through **LoRA adapters** rather than in full:
+`FLUX2_LORA_ENABLED=true bash scripts/flux2/run_train_flux2_klein_goal_prior_stage2.sh` freezes the
+expert's 3.876B base weights and trains 23.6M adapters at rank 16, leaving the Action Expert and the
+aggregator modules fully trainable. It is off by default and is **not** the configuration behind any
+number in §2 — freezing the expert removes its ability to adapt to the LIT regime. See
+`docs/flux2_architecture.md` §5.2 for the rank/parameter table and the merge-on-save requirement.
+
 ---
 
 ## 3. How LIT is integrated in ImageWAM

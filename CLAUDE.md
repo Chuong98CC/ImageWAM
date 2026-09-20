@@ -28,8 +28,10 @@ uv sync --python 3.11 --extra shared && source .venv/bin/activate
 cp .env.example .env.local          # scripts/common.sh sources this automatically
 ```
 
-`scripts/common.sh:imagewam_init` `cd`s to the repo root, sources `.env.local`, and prepends the venv's
-`nvidia/npp/lib` to `LD_LIBRARY_PATH` (required by TorchCodec's dlopen). Every `scripts/**/run_*.sh`
+`scripts/common.sh:imagewam_init` `cd`s to the repo root, sources `.env.local`, and probes both venvs for an
+`nvidia/npp/lib` to prepend to `LD_LIBRARY_PATH`. That probe is a no-op today: neither venv ships an
+`nvidia-npp` wheel, and TorchCodec's `libnppicc.so.12` resolves from the system CUDA toolkit via `ldconfig`.
+Every `scripts/**/run_*.sh`
 entrypoint goes through it, and calls `imagewam_require_env` for the variables it needs — so missing
 configuration fails with exit code 2 rather than a stack trace. Required: `DATA_ROOT`, `FLUX2_SRC`,
 `FLUX2_MODEL_PATH`, `FLUX2_AE_MODEL_PATH`, `FLUX2_QWEN3_MODEL_SPEC`.
@@ -218,6 +220,13 @@ Results land in `evaluate_results/<family>/<ckpt_tag>/<run_ts>/` as `gpu*_task*_
 `summary.json` and `task_success_rates.csv` (`summarize_results.py`). RoboTwin uses the parallel
 `experiments/robotwin/` manager and the `imagewam_policy` adapter symlinked into `third_party/RoboTwin`.
 
+RoboTwin evaluation runs from a **separate venv**, `.venv_rb2`, built by
+`scripts/setup/install_robotwin_env.sh` — RoboTwin's requirements are largely unpinned and would otherwise
+downgrade `.venv`'s pins (its `moviepy` caps `pillow<12`, against the `pillow==12.0.0` pin). The FLUX.2 model
+loads *in-process* with the Sapien simulator, so that env carries the full ImageWAM stack **plus** the
+simulator deps. The two FLUX.2 robotwin launchers call `imagewam_robotwin_env` after `imagewam_init`;
+`ROBOTWIN_VENV` overrides the path.
+
 ## Gotchas
 
 - **Metrics must be emitted on every rank, every step.** The trainer all-gathers one `accelerator.gather` call
@@ -237,8 +246,12 @@ Results land in `evaluate_results/<family>/<ckpt_tag>/<run_ts>/` as `gpu*_task*_
   `pretrained_norm_stats`; the launchers override them, so don't rely on the YAML directly.
 - `third_party/flux2` is gitignored and must be cloned separately; `third_party/RoboTwin/assets/` ships only
   `_download.py`.
-- Stage-2 video decoding needs the `LD_LIBRARY_PATH` fix from `imagewam_init`, otherwise dataloader workers
-  fail to load `libnppicc.so.11`.
+- **A `uv sync` on `.venv_rb2` silently wipes the RoboTwin overlay.** `uv sync` removes anything not in
+  `uv.lock`, which is exactly the `transformers==4.56.1` + sapien/mplib/curobo layer. Re-run the whole
+  `install_robotwin_env.sh` rather than sync alone — it is guarded to skip the slow curobo rebuild.
+- Stage-2 video decoding needs `libnppicc.so.12` on the loader path (TorchCodec's `libtorchcodec_core*.so`
+  links it). `imagewam_init`'s `nvidia/npp/lib` probe does **not** supply it — it comes from the system CUDA
+  toolkit via `ldconfig`, so a box without one installed fails here.
 - Frozen-FLUX stage 1 still runs the 25 frozen layers through autograd (gradient must reach the goal encoder),
   so `mot_checkpoint_mixed_attn=true` checkpoints the whole FLUX/Action MLP per layer — checkpointing only
   mixed attention OOMs at bs=128.
