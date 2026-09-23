@@ -616,6 +616,7 @@ def run_single_episode(
     num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 5))
     use_action_ensembler = bool(cfg.EVALUATION.get("use_action_ensembler", False))
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
+    save_rollout_video_enabled = bool(cfg.EVALUATION.get("save_rollout_video", False))
     capture_steps = set(_get_future_frame_capture_steps(cfg)[1:])
 
     env.reset()
@@ -669,10 +670,12 @@ def run_single_episode(
                 pending_actions = [ensembler.get_action(ts).tolist() for ts in range(t, t + replan_steps)]
             else:
                 pending_actions = action_chunk[:replan_steps].tolist()
-            replay_images.append(imgs.copy())
+            if save_rollout_video_enabled:
+                replay_images.append(imgs.copy())
         else:
-            imgs = get_libero_image(obs)
-            replay_images.append(imgs.copy())
+            if save_rollout_video_enabled:
+                imgs = get_libero_image(obs)
+                replay_images.append(imgs.copy())
 
         obs, _, done, _ = env.step(pending_actions.pop(0))
         if visualize_future_video and current_predicted_future_clip is not None:
@@ -752,6 +755,7 @@ def run_single_task(
 ) -> dict:
     env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, cfg.get("seed"))
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
+    save_rollout_video_enabled = bool(cfg.EVALUATION.get("save_rollout_video", False))
     results = {
         "successes": 0,
         "failure_episodes": [],
@@ -784,13 +788,14 @@ def run_single_task(
         if visualize_future_video:
             results["episode_future_video_psnr"].append(episode_mean_psnr)
 
-        save_rollout_video(
-            video_dir,
-            replay_images,
-            f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
-            success=success,
-            task_description=task_description,
-        )
+        if save_rollout_video_enabled:
+            save_rollout_video(
+                video_dir,
+                replay_images,
+                f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
+                success=success,
+                task_description=task_description,
+            )
         if visualize_future_video:
             if len(predicted_future_video_clips) == 0:
                 logging.warning(
@@ -902,7 +907,8 @@ def eval_single_process(cfg: DictConfig):
         local_log_dir = Path(cfg.EVALUATION.output_dir)
         local_log_dir.mkdir(parents=True, exist_ok=True)
         video_dir = local_log_dir / cfg.EVALUATION.task_suite_name / "videos"
-        video_dir.mkdir(parents=True, exist_ok=True)
+        if bool(cfg.EVALUATION.get("save_rollout_video", False)):
+            video_dir.mkdir(parents=True, exist_ok=True)
         predicted_video_dir = local_log_dir / cfg.EVALUATION.task_suite_name / "predicted_videos"
         if bool(cfg.EVALUATION.get("visualize_future_video", False)):
             predicted_video_dir.mkdir(parents=True, exist_ok=True)

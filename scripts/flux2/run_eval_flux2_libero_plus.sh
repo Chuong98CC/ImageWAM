@@ -47,6 +47,7 @@ COMMON=(
   MULTIRUN.max_tasks_per_gpu="${MAX_TASKS_PER_GPU:-2}"
   EVALUATION.action_horizon="${ACTION_HORIZON:-16}"
   EVALUATION.replan_steps="${REPLAN_STEPS:-12}"
+  EVALUATION.save_rollout_video="${SAVE_ROLLOUT_VIDEO:-false}"
 )
 
 if [ -n "${QWEN_CACHE_DIR}" ]; then

@@ -54,6 +54,11 @@ Both launchers run the manager in `experiments/libero/`; results are written per
 `gpu*_task*_results.json` with `summary.json` and `task_success_rates.csv` alongside. Aggregate the
 LIBERO-Plus run per axis with `scripts/aggregate.py` in the LIT hub.
 
+Rollout MP4s are **off by default**: writing one means holding every frame of an episode in memory and
+encoding it at the end. Pass `SAVE_ROLLOUT_VIDEO=true` (equivalently `EVALUATION.save_rollout_video=true`)
+to write them to the suite's `videos/` directory. This is separate from `EVALUATION.visualize_future_video`,
+which also renders the GT-vs-predicted comparison clips and is likewise off by default.
+
 ---
 
 ## 2. Train, then evaluate
