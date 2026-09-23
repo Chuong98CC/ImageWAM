@@ -1,0 +1,107 @@
+_target_: imagewam.runtime.create_imagewam_flux2_klein
+
+flux2_src_path: ???
+flux2_model_path: ???
+ae_model_path: ???
+variant: klein-base-4b
+qwen3_model_spec: Qwen/Qwen3-4B
+qwen_context_len: 512
+load_text_encoder: false
+proprio_dim: null
+mot_checkpoint_mixed_attn: true
+mot_gqa_implementation: repeat
+mot_force_flash_attention: false
+pack_proprio_after_text: true
+action_dit_pretrained_path: null
+
+# Stage 1b: reconstruct the future image and predict the future SE(3) goal pose,
+# with no action prediction at all.
+#
+# The Action Expert is excluded, not deleted. It is still built into the MoT --
+# removing the module would break the checkpoint key contract, the Stage1->2
+# bridge and the inference path -- but Stage 1b never invokes it, it produces no
+# loss, and `apply_trainable_policy` freezes it. The action stream is ~16 tokens
+# against 784 image tokens, so nothing is saved by taking it out of the graph;
+# what changes is the objective, not the compute.
+#
+# No Stage 1 checkpoint. Stage 1 trains exactly two things: `goal_pose_encoder`
+# (which the Stage1->2 bridge drops) and the Action Expert (which Stage 1b never
+# runs). Neither is used here, so Stage 1b trains from the base FLUX.2 init with
+# a freshly initialised aggregator.
+goal_prior_stage: stage1b
+goal_prior:
+  # Pose latents only. Stage 2's other 92 latents exist to be projected into
+  # synthetic K/V for the Action Expert; with no Action Expert they would be
+  # computed every layer, read by nothing, and receive no gradient -- which is
+  # the unused-parameter condition that stalls the trainer's per-key all-gather.
+  # `validate_pose_only_latent_layout` rejects any other split.
+  num_latents: 8
+  num_pose_tokens: 8
+  num_layer_groups: 5
+  latent_dim: 768
+  inner_dim: 512
+  lambda_pose: 0.3
+
+  # Deliberately absent, and should stay that way: context_token_dropout,
+  # context_blackout_prob, action_sees_ref, p_both, p_ref_only, p_syn_only,
+  # zero_init_value, syn_gate_bias_init, gate_pose_tokens, latent_layout. Each
+  # one shapes the Action Expert's view of the synthetic channel, so under
+  # Stage 1b it is inert. `_configure_goal_prior` warns if any is set away from
+  # its default rather than letting it pass silently.
+
+# --- LoRA on the video expert ------------------------------------------------
+# Stage 1b's two losses reach disjoint parameters: nothing in the video stream
+# consumes the aggregator, so `lambda_video` trains only the video expert and
+# `lambda_pose` trains only the aggregator and the pose head. Under LoRA the
+# video expert's 3.876B base weights are frozen and its 23.6M adapters train in
+# their place -- see docs/flux2_architecture.md §5.2.
+#
+# WARNING: a LoRA-trained checkpoint must be saved merged. The eval loader
+# rebuilds the model without adapters, so `enabled: true, save_lora_merged:
+# false` produces checkpoints the fail-closed loader rejects. The launcher sets
+# the merge flag for you.
+flux2_lora_config:
+  enabled: false
+  rank: 16          # adapter params: 11.8M @ 8, 23.6M @ 16, 47.2M @ 32, 94.4M @ 64
+  alpha: 16.0       # scaling is alpha/rank; keep alpha == rank for a scaling of 1.0
+  dropout: 0.0
+  save_lora_merged: false
+  save_trainable_only: false
+  target_suffixes:
+    - qkv
+    - proj
+    - linear1
+    - linear2
+    - img_mlp.0
+    - img_mlp.2
+    - txt_mlp.0
+    - txt_mlp.2
+
+# Still required: the Action Expert is constructed even though Stage 1b never
+# runs it, and `action_dit_pretrained_path` is what initialises its weights.
+action_dit_config:
+  action_dim: ${data.train.processor.action_output_dim}
+  hidden_dim: 1024
+  num_heads: 24
+  attn_head_dim: 128
+  num_layers_double: 5
+  num_layers_single: 20
+  mlp_ratio: 4.0
+  max_action_horizon: 64
+  use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
+
+video_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+action_scheduler:
+  train_shift: 5.0
+  infer_shift: 5.0
+  num_train_timesteps: 1000
+
+# No `lambda_action`: there is no action term to weight. The trainer would read a
+# default of 1.0 and it would be multiplied by nothing.
+loss:
+  lambda_video: 0.5
+  lambda_pose: 0.3

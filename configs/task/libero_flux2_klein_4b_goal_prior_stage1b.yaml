@@ -1,0 +1,49 @@
+# @package _global_
+
+defaults:
+  - override /data: libero_omnigen2_pair
+  - override /model: imagewam_flux2_klein_4b_goal_prior_stage1b
+  - _self_
+
+data:
+  train:
+    require_text_cache: false
+    qwen_text_cache_dir: ???
+    qwen_context_len: 512
+    qwen_text_cache_format: qwen3_flux2
+    # Author-specific path, overridden by every launcher. Stage 1b must reuse the
+    # baseline min/max so its video/pose losses are on the same scale as the
+    # comparison runs.
+    pretrained_norm_stats: /data2/JM/Code/ImageWAM/runs/libero_flux2_klein_4b_base_imagewam/2026-08-13_00-24-52/dataset_stats.json
+
+batch_size: 10
+num_workers: 24
+prefetch_factor: 2
+persistent_workers: true
+
+learning_rate: 1e-4
+warmup_steps: null   # 5 percent rule -> 1736, identical to the baseline run
+num_epochs: 10
+max_steps: null
+log_every: 10
+save_every: 1000
+eval_every: 100
+eval_num_samples: 8
+keep_latest_state_only: true
+
+gradient_accumulation_steps: 1
+weight_decay: 1.0e-2
+mixed_precision: "bf16"
+resume: null
+# Stage 1b has no Action Expert and so nothing to inherit from Stage 1. The
+# trainer raises if this is set for any stage other than `stage2`.
+stage1_checkpoint: null
+
+model:
+  proprio_dim: ${data.train.processor.proprio_output_dim}
+
+wandb:
+  enabled: true
+  mode: offline
+  project: imagewam
+  name: libero_flux2_klein_4b_goal_prior_stage1b

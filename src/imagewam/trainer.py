@@ -746,6 +746,11 @@ class Wan22Trainer:
         is_image_prediction_stack = is_omnigen2_stack or is_ovis_u1_stack or is_flux2_stack or is_dim_stack
         goal_prior_stage = getattr(model, "goal_prior_stage", None)
         stage1_eval = goal_prior_stage == "stage1"
+        # Stage 1b excludes the Action Expert, so there is no policy to roll out
+        # and no action metric that would mean anything. It does keep the image
+        # stream, which is why this is a separate flag rather than stage1_eval:
+        # the video sample is still needed for the reconstruction loss.
+        pose_only_eval = goal_prior_stage == "stage1b"
         rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
         eval_indices = torch.randint(
             0,
@@ -772,6 +777,14 @@ class Wan22Trainer:
                     val_loss, val_loss_dict = model.training_loss(sample)
                     val_loss = val_loss.float().item()
                 pose_loss = val_loss_dict.get("loss_pose") if isinstance(val_loss_dict, dict) else None
+                # Only Stage 1b reports the video term separately: for the other
+                # stages `val_loss` already carries it and adding a key would
+                # change their logged output for no reason.
+                video_loss = (
+                    val_loss_dict.get("loss_video")
+                    if pose_only_eval and isinstance(val_loss_dict, dict)
+                    else None
+                )
 
                 prompt = sample["prompt"][0]
                 action = sample["action"][0] if "action" in sample and sample["action"] is not None else None
@@ -812,9 +825,11 @@ class Wan22Trainer:
                 else:
                     infer_kwargs["prompt"] = prompt
 
-                pred = model.infer(
-                    **infer_kwargs,
-                )
+                # Stage 1b skips inference outright. `infer` would run the
+                # baseline video path, which does not route through the
+                # aggregator, so its PSNR would not measure this stage's
+                # objective -- and its action output comes from an untrained head.
+                pred = {} if pose_only_eval else model.infer(**infer_kwargs)
 
                 pred_video = pred.get("video") or []
                 pred_action = pred.get("action", None)
@@ -826,7 +841,7 @@ class Wan22Trainer:
                 psnr_rollout_vs_decode = 0.0
                 ssim_rollout_vs_decode = 0.0
                 image_metrics_valid = 0.0
-                if not stage1_eval:
+                if not stage1_eval and not pose_only_eval:
                     # 3. inference metrics against GT video
                     pred_video_tensor = pil_frames_to_video_tensor(pred_video)
                     gt_video_tensor = ((video0.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5).contiguous()
@@ -916,7 +931,7 @@ class Wan22Trainer:
                     action_l2 = action_diff.pow(2).masked_select(action_valid).sum().div(valid_count).item()
 
                 # 4. VAE reconstruction metrics against GT target.
-                if not stage1_eval:
+                if not stage1_eval and not pose_only_eval:
                     if is_omnigen2_stack:
                         gt_final = video0[:, -1].unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
                         vae_latents = model._encode_omnigen2_image_latents(gt_final)
@@ -986,6 +1001,7 @@ class Wan22Trainer:
 
                 action_valid = action_l2 is not None and action_l1 is not None
                 pose_valid = pose_loss is not None
+                video_loss_valid = video_loss is not None
                 local_metric_rows.append(
                     [
                         float(val_loss),
@@ -1001,6 +1017,8 @@ class Wan22Trainer:
                         float(pose_loss) if pose_valid else 0.0,
                         1.0 if pose_valid else 0.0,
                         float(image_metrics_valid),
+                        float(video_loss) if video_loss_valid else 0.0,
+                        1.0 if video_loss_valid else 0.0,
                     ]
                 )
         finally:
@@ -1027,6 +1045,10 @@ class Wan22Trainer:
         if pose_valid_count.item() > 0:
             pose_loss_mean = (gathered_metrics[:, 10].sum() / pose_valid_count).item()
         image_valid_count = gathered_metrics[:, 12].sum() if gathered_metrics.shape[1] > 12 else gathered_metrics.new_tensor(float(gathered_metrics.shape[0]))
+        video_loss_count = gathered_metrics[:, 14].sum() if gathered_metrics.shape[1] > 14 else torch.zeros((), device=gathered_metrics.device)
+        video_loss_mean = None
+        if video_loss_count.item() > 0:
+            video_loss_mean = (gathered_metrics[:, 13].sum() / video_loss_count).item()
 
         result = {
             "val_loss": float(mean_metrics[0].item()),
@@ -1050,6 +1072,8 @@ class Wan22Trainer:
             result["action_l1"] = float(action_l1_mean)
         if pose_loss_mean is not None:
             result["loss_pose"] = float(pose_loss_mean)
+        if pose_only_eval and video_loss_mean is not None:
+            result["loss_video"] = float(video_loss_mean)
         return result
 
     def _save_weights_checkpoint(self, step_tag: str):
@@ -1326,12 +1350,14 @@ class Wan22Trainer:
                                 description += " action_l1=%.4f" % metrics["action_l1"]
                             if "loss_pose" in metrics:
                                 description += " loss_pose=%.4f" % metrics["loss_pose"]
+                            if "loss_video" in metrics:
+                                description += " loss_video=%.4f" % metrics["loss_video"]
                             logger.info(description)
                             eval_payload = {
                                 "eval/num_samples": int(metrics["num_samples"]),
                                 "eval/val_loss": float(metrics["val_loss"]),
                             }
-                            for key in ("psnr_rg", "ssim_rg", "psnr_rd", "ssim_rd", "psnr_dg", "ssim_dg", "action_l2", "action_l1", "loss_pose"):
+                            for key in ("psnr_rg", "ssim_rg", "psnr_rd", "ssim_rd", "psnr_dg", "ssim_dg", "action_l2", "action_l1", "loss_pose", "loss_video"):
                                 if key in metrics:
                                     eval_payload[f"eval/{key}"] = float(metrics[key])
                             self._wandb_log(eval_payload)

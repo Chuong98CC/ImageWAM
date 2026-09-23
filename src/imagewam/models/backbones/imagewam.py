@@ -125,16 +125,37 @@ class ImageWAM(torch.nn.Module):
             GOAL_PRIOR_POSE_LOSS_WEIGHT,
             GOAL_PRIOR_SYN_GATE_BIAS_INIT,
             GOAL_PRIOR_ZERO_INIT_VALUE,
+            GOAL_PRIOR_STAGES,
+            STAGE1B,
             GoalPoseDecoder,
             GoalPoseEncoder,
             SemanticVisualAggregator,
+            non_default_action_facing_knobs,
+            validate_pose_only_latent_layout,
         )
 
         stage = None if goal_prior_stage in (None, "", "none", "baseline") else str(goal_prior_stage)
-        if stage is not None and stage not in {"stage1", "stage2"}:
-            raise ValueError(f"`goal_prior_stage` must be 'stage1' or 'stage2', got {goal_prior_stage!r}")
+        if stage is not None and stage not in GOAL_PRIOR_STAGES:
+            raise ValueError(
+                f"`goal_prior_stage` must be one of {GOAL_PRIOR_STAGES}, got {goal_prior_stage!r}"
+            )
         self.goal_prior_stage = stage
         cfg = dict(goal_prior or {})
+        if stage == STAGE1B:
+            # Every one of these shapes the Action Expert's view of the synthetic
+            # channel, and Stage 1b has no Action Expert. They are still handed
+            # to the aggregator -- so an invalid combination still raises -- but
+            # nothing consumes their effect, which is exactly the kind of silent
+            # inertness that once produced a 35-hour run where every new
+            # mechanism was dead.
+            inert = non_default_action_facing_knobs(cfg)
+            if inert:
+                logger.warning(
+                    "Stage 1b excludes the Action Expert, so these goal_prior knobs have no "
+                    "effect on training and their configured values do nothing: %s. "
+                    "Leave them at their defaults in a Stage 1b config.",
+                    ", ".join(f"{name}={value!r}" for name, value in inert),
+                )
         self.goal_pose_encoder = None
         self.semantic_visual_aggregator = None
         self.semantic_visual_pose_norm = None
@@ -186,6 +207,8 @@ class ImageWAM(torch.nn.Module):
             raise ValueError(
                 f"`num_pose_tokens` must satisfy 1 <= pose_tokens <= latents, got {num_pose_tokens}/{num_latents}"
             )
+        if stage == STAGE1B:
+            validate_pose_only_latent_layout(num_latents, num_pose_tokens)
         self.goal_prior_num_pose_tokens = num_pose_tokens
         self.semantic_visual_aggregator = SemanticVisualAggregator(
             num_tokens=num_latents,
@@ -2663,11 +2686,15 @@ class ImageWAM(torch.nn.Module):
         }
 
     def _training_loss_flux2(self, sample, tiled: bool = False):
+        from .goal_pose_prior import STAGE1B
+
         stage = getattr(self, "goal_prior_stage", None)
         if stage == "stage1":
             return self._training_loss_flux2_stage1(sample, tiled=tiled)
         if stage == "stage2":
             return self._training_loss_flux2_stage2(sample, tiled=tiled)
+        if stage == STAGE1B:
+            return self._training_loss_flux2_stage1b(sample, tiled=tiled)
         return self._training_loss_flux2_baseline(sample, tiled=tiled)
 
     def _training_loss_flux2_baseline(self, sample, tiled: bool = False):
@@ -2988,6 +3015,99 @@ class ImageWAM(torch.nn.Module):
             syn_channel_keep=syn_channel_keep,
         ))
         return loss_total, metrics
+
+    def _training_loss_flux2_stage1b(self, sample, tiled: bool = False):
+        """Video reconstruction plus SE(3) goal prediction, with no Action Expert.
+
+        The two terms reach disjoint parameter sets, which is the point of the
+        stage: nothing in the video stream consumes the aggregator, so
+        `loss_video` trains only the video expert, and `loss_pose` trains only
+        the aggregator and the pose head. The aggregator is therefore trained
+        purely as a pose predictor, with no action objective to lean on.
+        """
+        from .goal_pose_prior import STAGE1B, compute_pose_reconstruction_loss
+
+        inputs = self.build_inputs_flux2(sample, tiled=tiled)
+        goal_pose, goal_is_pad, goal_dim_is_pad = self._sample_goal_pose(sample)
+        target_latent = inputs["target_latent"]
+        batch_size = int(target_latent.shape[0])
+
+        noise_video = torch.randn_like(target_latent)
+        timestep_video = self.train_video_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=self.device,
+            dtype=target_latent.dtype,
+        )
+        noisy_latent = self.train_video_scheduler.add_noise(target_latent, noise_video, timestep_video)
+        target_video = self.train_video_scheduler.training_target(target_latent, noise_video, timestep_video)
+
+        video_pre = self.video_expert.pre_dit(
+            x=noisy_latent,
+            timestep=self._scheduler_timestep_to_unit(timestep_video, self.train_video_scheduler),
+            context=inputs["text_hidden_states"],
+            context_mask=inputs["text_attention_mask"],
+            ref_image_hidden_states=inputs["ref_image_latents"],
+            target_img_ids=inputs["target_img_ids"],
+            ref_img_ids=inputs["ref_img_ids"],
+        )
+        # Built with `action_len=0`, exactly as Stage 2 does: the video rows take
+        # the same mask whether or not an Action Expert exists downstream.
+        video_mask = self._build_mot_attention_mask_flux2(
+            batch_size=batch_size,
+            txt_len=int(video_pre["txt_len"]),
+            target_len=int(video_pre["target_len"]),
+            cond_len=int(video_pre["cond_len"]),
+            action_len=0,
+            device=noisy_latent.device,
+            text_attention_mask=video_pre["text_mask"],
+        )
+        tokens_out = self.mot(
+            embeds_all={"video": video_pre["tokens"]},
+            attention_mask={
+                "double_joint": video_mask["double_joint"],
+                "single": video_mask["single"],
+            },
+            freqs_all={"video": video_pre["freqs"]},
+            context_all={
+                "video": None,
+                "goal_prior": {
+                    "mode": STAGE1B,
+                    "aggregator": self.semantic_visual_aggregator,
+                    "text_mask": video_pre["text_mask"],
+                    "cond_len": int(video_pre["cond_len"]),
+                    "target_len": int(video_pre["target_len"]),
+                },
+            },
+            t_mod_all={"video": video_pre["t_mod"]},
+        )
+        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+        pose_hidden = self.semantic_visual_pose_norm(
+            tokens_out["goal_latents"][:, : int(self.goal_prior_num_pose_tokens)]
+        )
+        pred_pose = self.semantic_visual_pose_decoder(pose_hidden)
+        loss_pose = compute_pose_reconstruction_loss(
+            pred_pose,
+            goal_pose,
+            is_pad=goal_is_pad,
+            dim_is_pad=goal_dim_is_pad,
+        )
+
+        video_loss_per_sample = (
+            F.mse_loss(pred_video.float(), target_video.float(), reduction="none").flatten(1).mean(dim=1)
+        )
+        video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
+            video_loss_per_sample.device,
+            dtype=video_loss_per_sample.dtype,
+        )
+        loss_video = (video_loss_per_sample * video_weight).mean()
+        loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_pose * loss_pose
+        return loss_total, {
+            "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
+            "loss_pose": self.loss_lambda_pose * float(loss_pose.detach().item()),
+            # The weighted term above is what the optimiser sees; this is the raw
+            # MSE, which is the number that should collapse under overfitting.
+            "pose/mse_raw": float(loss_pose.detach().item()),
+        }
 
     def _goal_prior_diagnostics(
         self,
@@ -5273,7 +5393,7 @@ class ImageWAM(torch.nn.Module):
         torch.save(payload, path)
 
     def load_checkpoint(self, path, optimizer=None, goal_prior_bridge: bool = False):
-        from .goal_pose_prior import validate_goal_prior_checkpoint_keys
+        from .goal_pose_prior import GOAL_PRIOR_STAGES, validate_goal_prior_checkpoint_keys
 
         payload = torch.load(path, map_location="cpu")
         logger.info("Loading ImageWAM checkpoint from %s with payload keys=%s step=%s", path, sorted(payload.keys()), payload.get("step"))
@@ -5314,7 +5434,7 @@ class ImageWAM(torch.nn.Module):
                 len(missing_keys),
                 len(unexpected_keys),
             )
-            if current_stage in {"stage1", "stage2"}:
+            if current_stage in GOAL_PRIOR_STAGES:
                 # LoRA adapters are stage-2-only: a stage-2 run wraps the video
                 # expert and loads a stage-1 payload that predates the wrappers, so
                 # `lora_A`/`lora_B` are absent by construction and are initialised
@@ -5357,14 +5477,14 @@ class ImageWAM(torch.nn.Module):
             if "proprio_encoder" in payload:
                 self.proprio_encoder.load_state_dict(payload["proprio_encoder"], strict=True)
                 logger.info("Loaded proprio_encoder weights from checkpoint.")
-            elif current_stage in {"stage1", "stage2"}:
+            elif current_stage in GOAL_PRIOR_STAGES:
                 raise RuntimeError("Goal-prior checkpoint is missing required `proprio_encoder` weights.")
             else:
                 logger.warning("Checkpoint has no `proprio_encoder` weights; keeping current `proprio_encoder` params.")
         elif "proprio_encoder" in payload:
             logger.warning("Checkpoint contains `proprio_encoder` weights but current model has `proprio_dim=None`; ignoring.")
 
-        if current_stage in {"stage1", "stage2"}:
+        if current_stage in GOAL_PRIOR_STAGES:
             missing = []
             unexpected = []
             module_specs = [
@@ -5440,14 +5560,42 @@ class ImageWAM(torch.nn.Module):
                 trainable += 1
         return trainable
 
+    def _freeze_synthetic_kv_head(self, aggregator) -> int:
+        """Freeze the K/V projection that only the Action Expert would consume.
+
+        Stage 1b never runs an Action Expert, so these tensors are computed
+        nowhere. Leaving them `requires_grad` is not merely wasteful: a
+        parameter that reaches no loss produces no gradient, which is exactly
+        the unused-parameter condition that stalls the trainer's per-key
+        all-gather.
+        """
+        frozen = 0
+        for group in getattr(aggregator, "groups", ()):
+            for name in ("to_key", "to_value", "key_norm"):
+                module = getattr(group, name, None)
+                if module is None:
+                    continue
+                for param in module.parameters():
+                    param.requires_grad = False
+                    frozen += 1
+            # A bare Parameter rather than a module, so it is set by hand.
+            bias = getattr(group, "syn_gate_bias", None)
+            if bias is not None:
+                bias.requires_grad = False
+                frozen += 1
+        return frozen
+
     def apply_trainable_policy(self) -> None:
         """Refine trainer's default DiT-only policy for parameter-efficient modes.
 
         Precedence per stage: for the goal-prior stages the video expert is either
-        frozen outright (stage 1) or fully trainable (stage 2), and only Stage 2 has
-        a LoRA variant -- adapters train in place of the base weights. The baseline
-        (`goal_prior_stage is None`) reads its LoRA switch off the expert.
+        frozen outright (stage 1) or fully trainable (stage 2, stage 1b), and only
+        those two have a LoRA variant -- adapters train in place of the base
+        weights. The baseline (`goal_prior_stage is None`) reads its LoRA switch
+        off the expert.
         """
+        from .goal_pose_prior import STAGE1B
+
         if self.stack != "flux2":
             return
         video_expert = self.mot.mixtures["video"] if "video" in self.mot.mixtures else None
@@ -5476,13 +5624,14 @@ class ImageWAM(torch.nn.Module):
                 self.goal_pose_encoder.train()
                 self.goal_pose_encoder.requires_grad_(True)
             return
-        if stage == "stage2":
+        if stage in ("stage2", STAGE1B):
             if video_expert is not None:
                 if lora_enabled:
                     adapters = self._apply_expert_lora_freeze(video_expert)
                     logger.info(
-                        "Stage 2 LoRA policy: video expert base weights frozen, "
+                        "Stage %s LoRA policy: video expert base weights frozen, "
                         "%d adapter tensors trainable (targets=%s).",
+                        stage,
                         adapters,
                         getattr(video_expert, "flux2_lora_target_suffixes", ()),
                     )
@@ -5497,6 +5646,23 @@ class ImageWAM(torch.nn.Module):
                 if module is not None:
                     module.train()
                     module.requires_grad_(True)
+            if stage == STAGE1B:
+                # Stage 1b's whole point is that no action is ever predicted, so
+                # the Action Expert is excluded rather than merely unweighted: it
+                # stays in `mixtures` (deleting it would break the checkpoint key
+                # contract, the Stage1->2 bridge and the inference path) but it is
+                # never invoked and contributes no gradient.
+                if action_expert is not None:
+                    action_expert.eval()
+                    action_expert.requires_grad_(False)
+                if self.semantic_visual_aggregator is not None:
+                    frozen = self._freeze_synthetic_kv_head(self.semantic_visual_aggregator)
+                    logger.info(
+                        "Stage 1b excludes the Action Expert: %d synthetic K/V head "
+                        "tensors frozen (nothing consumes them) and the Action Expert "
+                        "is frozen and in eval mode.",
+                        frozen,
+                    )
             return
         if not lora_enabled:
             return

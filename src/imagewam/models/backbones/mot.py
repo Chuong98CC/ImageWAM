@@ -14,6 +14,7 @@ import torch.utils.checkpoint
 
 from .wan_video_dit import modulate, rope_apply
 from .ovis_u1_imports import ensure_ovis_u1_remote_code_importable
+from .goal_pose_prior import STAGE1B
 from imagewam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -788,6 +789,12 @@ class MoT(nn.Module):
         aggregator = goal_prior.get("aggregator")
         if aggregator is None:
             raise ValueError("Stage2 FLUX.2 MoT requires goal_prior['aggregator'].")
+        # Stage 1b runs this same video + aggregator path with the Action Expert
+        # excluded: no noisy-action stream, no action mask, and no synthetic K/V
+        # projection (the Action Expert was its only consumer). The video stream
+        # is unaffected either way -- the Stage 2 mask is built with
+        # `action_len=0`, so video rows already attend no action column.
+        pose_only = str(goal_prior.get("mode", "")) == STAGE1B
         video_expert = self.mixtures["video"]
         action_expert = self.mixtures["action"]
         video_state = embeds_all["video"]
@@ -795,24 +802,33 @@ class MoT(nn.Module):
             raise ValueError("FLUX.2 video embeds must be a dict with `txt` and `img` tensors.")
         txt = video_state["txt"]
         img = video_state["img"]
-        action = embeds_all["action"]
-        if not isinstance(action, torch.Tensor):
+        action = embeds_all.get("action")
+        if not pose_only and not isinstance(action, torch.Tensor):
             raise ValueError("FLUX.2 action embeds must be a tensor.")
 
         video_freqs = freqs_all["video"]
         txt_pe = video_freqs["txt"]
         img_pe = video_freqs["img"]
-        action_ids = context_all["action"]["ids"]
-        action_pe = video_expert.transformer.pe_embedder(action_ids.to(device=img.device, dtype=img.dtype))
         video_t_mod = t_mod_all["video"]
-        action_t_mod = t_mod_all["action"]
         text_mask = goal_prior["text_mask"].to(device=txt.device, dtype=torch.bool)
-        action_mask = attention_mask["action"]
-        _sees_ref = bool(getattr(aggregator, "action_sees_ref", False))
-        _gate_active = bool(
-            aggregator is not None
-            and any(float(g.syn_gate_bias.detach()) != 0.0 for g in aggregator.groups)
-        )
+        # Everything below exists only to serve the Action Expert. Stage 1b
+        # leaves all of it unset, which is what "removed from the graph" means.
+        action_pe = None
+        action_t_mod = None
+        action_mask = None
+        _sees_ref = False
+        _gate_active = False
+        if not pose_only:
+            action_ids = context_all["action"]["ids"]
+            action_pe = video_expert.transformer.pe_embedder(
+                action_ids.to(device=img.device, dtype=img.dtype)
+            )
+            action_t_mod = t_mod_all["action"]
+            action_mask = attention_mask["action"]
+            _sees_ref = bool(getattr(aggregator, "action_sees_ref", False))
+            _gate_active = bool(
+                any(float(g.syn_gate_bias.detach()) != 0.0 for g in aggregator.groups)
+            )
         video_mask = attention_mask["double_joint"]
         txt_len = int(txt.shape[1])
         cond_len = int(goal_prior["cond_len"])
@@ -833,7 +849,10 @@ class MoT(nn.Module):
 
         for layer_idx in range(double_layers):
             v_block = video_expert.double_blocks[layer_idx]
-            a_block = action_expert.double_blocks[layer_idx]
+            # Left unresolved under Stage 1b rather than looked up and ignored:
+            # the Action Expert is out of the graph, so its blocks are never
+            # reached -- not even to read them.
+            a_block = None if pose_only else action_expert.double_blocks[layer_idx]
 
             def _double_layer(
                 img_tokens,
@@ -875,6 +894,11 @@ class MoT(nn.Module):
                     layer_idx=layer_idx,
                     num_layers=num_layers,
                 )
+                if action_tokens is None:
+                    # Stage 1b: the aggregator's latents are the whole output of
+                    # this layer, so there is nothing to steer and nothing to
+                    # project synthetic K/V for.
+                    return img_tokens, txt_tokens, None, goal_latents
                 syn_k, syn_v = self._flux2_project_synthetic_kv(
                     aggregator,
                     goal_latents,
@@ -924,7 +948,7 @@ class MoT(nn.Module):
                 latents,
                 video_t_mod["double_img"],
                 video_t_mod["double_txt"],
-                action_t_mod["double_img"],
+                action_t_mod["double_img"] if action_t_mod is not None else None,
             )
 
         video_stream = torch.cat([txt, img], dim=1)
@@ -932,7 +956,7 @@ class MoT(nn.Module):
         for local_idx in range(single_layers):
             layer_idx = double_layers + local_idx
             v_block = video_expert.single_blocks[local_idx]
-            a_block = action_expert.single_blocks[local_idx]
+            a_block = None if pose_only else action_expert.single_blocks[local_idx]
 
             def _single_layer(
                 stream,
@@ -962,6 +986,8 @@ class MoT(nn.Module):
                     layer_idx=layer_idx,
                     num_layers=num_layers,
                 )
+                if action_tokens is None:
+                    return stream, None, goal_latents
                 syn_k, syn_v = self._flux2_project_synthetic_kv(
                     aggregator,
                     goal_latents,
@@ -1009,16 +1035,18 @@ class MoT(nn.Module):
                 action,
                 latents,
                 video_t_mod["single"],
-                action_t_mod["single"],
+                action_t_mod["single"] if action_t_mod is not None else None,
             )
             txt = video_stream[:, :txt_len]
             img = video_stream[:, txt_len:]
 
-        return {
+        result = {
             "video": {"txt": txt, "img": img},
-            "action": action,
             "goal_latents": latents,
         }
+        if not pose_only:
+            result["action"] = action
+        return result
 
     def prefill_flux2_video_cache(
         self,
@@ -1714,7 +1742,7 @@ class MoT(nn.Module):
         if self.block_protocol == "flux2":
             goal_prior = None if context_all is None else context_all.get("goal_prior")
             mode = None if not isinstance(goal_prior, dict) else goal_prior.get("mode")
-            if mode == "stage2":
+            if mode in ("stage2", STAGE1B):
                 return self._forward_flux2_stage2(
                     embeds_all=embeds_all,
                     attention_mask=attention_mask,

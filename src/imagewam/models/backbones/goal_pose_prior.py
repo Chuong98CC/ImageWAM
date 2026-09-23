@@ -3,11 +3,13 @@
 Stage1 encodes an oracle future pose into 8 FLUX hidden tokens.
 Stage2 infers 100 recurrent latents (8 pose + 92 context) from language/state
 and current-image tokens, then steers ActionDiT through synthetic K/V.
+Stage1b is Stage2 without the Action Expert: the aggregator keeps only the pose
+latents and is trained by the pose reconstruction loss alone.
 """
 
 from __future__ import annotations
 
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Mapping, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -66,6 +68,30 @@ STAGE2_ONLY_CHECKPOINT_PREFIXES = (
     "semantic_visual_aggregator.",
     "semantic_visual_pose_norm.",
     "semantic_visual_pose_decoder.",
+)
+
+# Stage 1b: Stage 2's aggregator and pose head, with the Action Expert excluded
+# from the graph and the objective. The model still *builds* the Action Expert
+# (deleting the module would break the checkpoint key contract, the Stage1->2
+# bridge and the inference path, and the action stream is ~16 tokens against
+# 784 image tokens, so nothing is saved by removing it) -- it is simply never
+# invoked, never receives a loss, and is frozen.
+STAGE1B = "stage1b"
+GOAL_PRIOR_STAGES = ("stage1", "stage2", STAGE1B)
+# The knobs that only shape the Action Expert's view of the synthetic channel.
+# Under Stage 1b there is no Action Expert, so setting any of these to a
+# non-default value is silently inert -- the failure mode that once produced a
+# 35-hour run in which every new mechanism was inactive.
+ACTION_FACING_GOAL_PRIOR_KNOBS = (
+    "context_token_dropout",
+    "context_blackout_prob",
+    "action_sees_ref",
+    "p_both",
+    "p_ref_only",
+    "p_syn_only",
+    "zero_init_value",
+    "syn_gate_bias_init",
+    "gate_pose_tokens",
 )
 
 
@@ -727,6 +753,51 @@ def compute_pose_reconstruction_loss(
     return (per_sample * valid).sum() / valid.sum().clamp_min(1.0)
 
 
+def validate_pose_only_latent_layout(num_latents: int, num_pose_tokens: int) -> None:
+    """Stage 1b keeps only the pose latents.
+
+    The other 92 exist solely to be projected into synthetic K/V for the Action
+    Expert. Stage 1b does not run an Action Expert, so they would be computed
+    every layer and read by nothing: no gradient reaches them, which is both
+    wasted work and the unused-parameter condition that stalls the trainer's
+    per-key all-gather.
+    """
+    if int(num_latents) != int(num_pose_tokens):
+        raise ValueError(
+            "Stage 1b has no Action Expert, so the non-pose latents have no consumer. "
+            f"Set num_latents == num_pose_tokens (got {num_latents} and {num_pose_tokens})."
+        )
+    if int(num_pose_tokens) < 1:
+        raise ValueError(f"`num_pose_tokens` must be >= 1, got {num_pose_tokens}")
+
+
+def non_default_action_facing_knobs(goal_prior_cfg: Mapping[str, object]) -> list[tuple[str, object]]:
+    """Stage 1b knobs that were set away from their default, hence inert.
+
+    Returned rather than logged so the caller owns the message and the check is
+    testable without caplog.
+    """
+    defaults = {
+        "context_token_dropout": GOAL_PRIOR_CONTEXT_TOKEN_DROPOUT,
+        "context_blackout_prob": GOAL_PRIOR_CONTEXT_BLACKOUT_PROB,
+        "action_sees_ref": GOAL_PRIOR_ACTION_SEES_REF,
+        "p_both": GOAL_PRIOR_P_BOTH,
+        "p_ref_only": GOAL_PRIOR_P_REF_ONLY,
+        "p_syn_only": GOAL_PRIOR_P_SYN_ONLY,
+        "zero_init_value": GOAL_PRIOR_ZERO_INIT_VALUE,
+        "syn_gate_bias_init": GOAL_PRIOR_SYN_GATE_BIAS_INIT,
+        "gate_pose_tokens": GOAL_PRIOR_GATE_POSE_TOKENS,
+    }
+    found: list[tuple[str, object]] = []
+    for name in ACTION_FACING_GOAL_PRIOR_KNOBS:
+        if name not in goal_prior_cfg:
+            continue
+        value = goal_prior_cfg[name]
+        if value != defaults[name]:
+            found.append((name, value))
+    return found
+
+
 def _starts_with_any(key: str, prefixes: Sequence[str]) -> bool:
     return any(key.startswith(prefix) for prefix in prefixes)
 
@@ -743,7 +814,7 @@ def validate_goal_prior_checkpoint_keys(
     current_stage = str(current_stage)
     missing = list(missing_keys)
     unexpected = list(unexpected_keys)
-    if current_stage not in {"stage1", "stage2"}:
+    if current_stage not in GOAL_PRIOR_STAGES:
         raise ValueError(f"Unsupported goal-prior stage {current_stage!r}")
 
     if current_stage == "stage1":

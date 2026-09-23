@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# Goal-prior training, both stages that share this plumbing.
+#
+# GOAL_PRIOR_STAGE=stage2 (default) is the evaluated revision: video + action
+# experts plus the aggregator, bridged from a Stage 1 checkpoint.
+# GOAL_PRIOR_STAGE=stage1b excludes the Action Expert entirely -- no action loss,
+# no synthetic K/V, the aggregator carrying only the 8 pose latents. It therefore
+# takes no Stage 1 checkpoint and needs none: Stage 1's two products are the
+# goal_pose_encoder (which the bridge drops) and the Action Expert (which Stage 1b
+# never runs).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -7,6 +16,15 @@ source "${SCRIPT_DIR}/../common.sh"
 imagewam_init "${SCRIPT_DIR}/../.."
 # Keep goal-prior runs offline even if the shell/default train.yaml wants online.
 export WANDB_MODE=offline
+
+GOAL_PRIOR_STAGE="${GOAL_PRIOR_STAGE:-stage2}"
+case "${GOAL_PRIOR_STAGE}" in
+  stage2|stage1b) ;;
+  *)
+    echo "GOAL_PRIOR_STAGE must be stage2 or stage1b, got '${GOAL_PRIOR_STAGE}'" >&2
+    exit 2
+    ;;
+esac
 
 GPU_PER_NODE="${GPU_PER_NODE:-8}"
 FLUX2_VARIANT="${FLUX2_VARIANT:-4b}"
@@ -18,15 +36,17 @@ MODEL_ROOT="${MODEL_ROOT:-${REPO_ROOT}/checkpoints}"
 imagewam_require_env DATA_ROOT
 imagewam_require_env FLUX2_SRC
 imagewam_require_env FLUX2_AE_MODEL_PATH
-imagewam_require_env STAGE1_CHECKPOINT
+if [ "${GOAL_PRIOR_STAGE}" = "stage2" ]; then
+  imagewam_require_env STAGE1_CHECKPOINT
+fi
 
 if [ "${FLUX2_VARIANT}" != "4b" ]; then
   echo "Goal-pose prior Stage2 currently supports FLUX2_VARIANT=4b only, got ${FLUX2_VARIANT}" >&2
   exit 1
 fi
 
-MODEL_CONFIG="configs/model/imagewam_flux2_klein_4b_goal_prior_stage2.yaml"
-TASK_NAME="libero_flux2_klein_4b_goal_prior_stage2"
+MODEL_CONFIG="configs/model/imagewam_flux2_klein_4b_goal_prior_${GOAL_PRIOR_STAGE}.yaml"
+TASK_NAME="libero_flux2_klein_4b_goal_prior_${GOAL_PRIOR_STAGE}"
 FLUX2_QWEN3_MODEL_SPEC="${FLUX2_QWEN3_MODEL_SPEC:-Qwen/Qwen3-4B}"
 FLUX2_MODEL_PATH="${FLUX2_MODEL_PATH:-${MODEL_ROOT}/flux2/FLUX.2-klein-base-4B/flux-2-klein-base-4b.safetensors}"
 export FLUX2_MODEL_PATH FLUX2_QWEN3_MODEL_SPEC ZERO_STAGE
@@ -101,10 +121,14 @@ COMMON_OVERRIDES=(
   "model.ae_model_path=${FLUX2_AE_MODEL_PATH}"
   "model.qwen3_model_spec=${FLUX2_QWEN3_MODEL_SPEC}"
   "model.action_dit_pretrained_path=${ACTION_INIT}"
-  "stage1_checkpoint=${STAGE1_CHECKPOINT}"
   "wandb.mode=offline"
   "${LORA_OVERRIDES[@]}"
 )
+if [ "${GOAL_PRIOR_STAGE}" = "stage2" ]; then
+  # Stage 1b has no Action Expert, so there is no Stage 1 payload to bridge from;
+  # the trainer rejects `stage1_checkpoint` for any other stage anyway.
+  COMMON_OVERRIDES+=("stage1_checkpoint=${STAGE1_CHECKPOINT}")
+fi
 
 TASK="${TASK_NAME}" imagewam_run bash scripts/flux2/train_flux2_klein_imagewam.sh "${GPU_PER_NODE}" \
   "${DATASET_OVERRIDES[@]}" \
