@@ -29,6 +29,7 @@ EVALUATION:
   binarize_gripper: true
   use_action_ensembler: false
   visualize_future_video: false
+  save_rollout_video: false
 
   # Action inference
   action_horizon: null
