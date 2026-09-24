@@ -6,6 +6,37 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../common.sh"
 imagewam_init "${SCRIPT_DIR}/../.."
 
+# LIBERO-plus, which lives in its own venv: both benchmarks install a package named "libero",
+# so sharing a venv means reinstalling one over the other on every switch. The manager (it
+# enumerates the task list) and the workers must use the same venv, and LIBERO_CONFIG_PATH must
+# point at that benchmark's assets -- so all three are derived here rather than left to
+# .env.local.
+LIBERO_PLUS_VENV="${LIBERO_PLUS_VENV:-${REPO_ROOT}/.venv_libero_plus}"
+if [ ! -x "${LIBERO_PLUS_VENV}/bin/python" ]; then
+  echo "LIBERO-plus venv not found: ${LIBERO_PLUS_VENV}" >&2
+  echo "Install it with: bash scripts/setup/_install_libero_plus_env.sh" >&2
+  exit 2
+fi
+LIBERO_PKG_DIR="$("${LIBERO_PLUS_VENV}/bin/python" -c 'import libero, os; print(os.path.dirname(libero.__file__))' 2>/dev/null || echo "<no libero installed>")"
+case "${LIBERO_PKG_DIR}" in
+  */LIBERO-plus/*) : ;;
+  "<no libero installed>")
+    echo "No libero package in ${LIBERO_PLUS_VENV}. Install it with:" >&2
+    echo "  bash scripts/setup/_install_libero_plus_env.sh" >&2
+    exit 2
+    ;;
+  *)
+    echo "${LIBERO_PLUS_VENV} has stock LIBERO installed, but this launcher evaluates LIBERO-plus." >&2
+    echo "Use scripts/flux2/run_eval_flux2_libero.sh, or install this benchmark first:" >&2
+    echo "  bash scripts/setup/_install_libero_plus_env.sh" >&2
+    exit 2
+    ;;
+esac
+PYTHON_BIN="${LIBERO_PLUS_VENV}/bin/python"
+LIBERO_WORKER_ENV_SOURCE="${LIBERO_PLUS_VENV}/bin/activate"
+LIBERO_CONFIG_PATH="${LIBERO_PLUS_CONFIG_PATH:-${HOME}/.libero_plus}"
+export PYTHON_BIN LIBERO_WORKER_ENV_SOURCE LIBERO_CONFIG_PATH
+
 SUITE="libero_plus"
 CONFIG_NAME="sim_libero_omnigen2"
 FLUX2_VARIANT="${FLUX2_VARIANT:-9b}" # 4b | 9b
@@ -27,9 +58,26 @@ export PYTHONPATH="${REPO_ROOT}/src:${FLUX2_SRC}/src:${FLUX2_SRC}${PYTHONPATH:+:
 export WORKER_PYTHONPATH="${PYTHONPATH}"
 export MUJOCO_GL="${MUJOCO_GL:-osmesa}"
 export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-osmesa}"
-LIBERO_WORKER_ENV_SOURCE="${LIBERO_WORKER_ENV_SOURCE:-}"
-export LIBERO_WORKER_ENV_SOURCE
 imagewam_prepare_eval_ckpt
+
+# Resume an interrupted run instead of evaluating everything again. Pass the directory the
+# previous run printed ("Evaluation results will be saved to: ..."), or set RESUME=1 to pick
+# the newest resumable run for this checkpoint:
+#   RESUME_DIR=evaluate_results/libero_omnigen2/model/20260923_201444 bash scripts/flux2/run_eval_flux2_libero_plus.sh
+#   RESUME=1 bash scripts/flux2/run_eval_flux2_libero_plus.sh
+RESUME="${RESUME:-false}"
+RESUME_DIR="${RESUME_DIR:-}"
+RESUME_FROM=""
+case "${RESUME}" in
+  1 | [Tt]rue | [Yy]es) RESUME_FROM="latest" ;;
+esac
+if [ -n "${RESUME_DIR}" ]; then
+  if [ ! -d "${RESUME_DIR}" ]; then
+    echo "RESUME_DIR is not a directory: ${RESUME_DIR}" >&2
+    exit 2
+  fi
+  RESUME_FROM="${RESUME_DIR}" # an explicit directory wins over RESUME=1
+fi
 
 COMMON=(
   --config-name "${CONFIG_NAME}"
@@ -54,6 +102,10 @@ if [ -n "${QWEN_CACHE_DIR}" ]; then
   COMMON+=(data.train.qwen_text_cache_dir="${QWEN_CACHE_DIR}")
 fi
 
+if [ -n "${RESUME_FROM}" ]; then
+  COMMON+=(MULTIRUN.resume_from="${RESUME_FROM}")
+fi
+
 COMMON+=(
   model.proprio_dim="${PROPRIO_DIM:-8}"
   model.qwen_context_len="${QWEN_CONTEXT_LEN:-128}"
@@ -66,4 +118,7 @@ COMMON+=(
 )
 
 imagewam_print_config SUITE TASK CKPT_PATH DATASET_STATS_PATH FLUX2_SRC FLUX2_MODEL_PATH FLUX2_AE_MODEL_PATH
+if [ -n "${RESUME_FROM}" ]; then
+  echo "[config] RESUME_FROM=${RESUME_FROM}"
+fi
 imagewam_run imagewam_python experiments/libero/run_libero_manager.py "${COMMON[@]}" "$@"

@@ -8,10 +8,20 @@ imagewam_init "${SCRIPT_DIR}/../.."
 
 LIBERO_PLUS_DIR="${LIBERO_PLUS_DIR:-${REPO_ROOT}/third_party/LIBERO-plus}"
 LIBERO_PLUS_REPO="${LIBERO_PLUS_REPO:-https://github.com/sylvestf/LIBERO-plus.git}"
-LIBERO_CONFIG_DIR="${LIBERO_CONFIG_DIR:-${HOME}/.libero}"
+# Its own config dir: both benchmarks read a single LIBERO_CONFIG_PATH (default ~/.libero), so
+# sharing it would leave one benchmark pointing at the other's assets/bddl/init states.
+LIBERO_CONFIG_DIR="${LIBERO_CONFIG_DIR:-${HOME}/.libero_plus}"
 LIBERO_PLUS_PKG_DIR="${LIBERO_PLUS_DIR}/libero/libero"
 LIBERO_PLUS_ASSETS_DIR="${LIBERO_PLUS_PKG_DIR}/assets"
 LIBERO_PLUS_NESTED_ASSETS_DIR="${LIBERO_PLUS_PKG_DIR}/inspire/hdd/project/embodied-multimodality/public/syfei/libero_new/release/dataset/LIBERO-plus-0/assets"
+# LIBERO-plus installs a package also named "libero", so it gets its own venv instead of
+# overwriting the LIBERO one (and its own config dir for assets/bddl/init states). The venv is
+# created here if missing; a bare `uv sync` on it later would wipe this overlay (same trap as
+# .venv_rb2), so re-run this script rather than syncing.
+LIBERO_PLUS_VENV="${LIBERO_PLUS_VENV:-${REPO_ROOT}/.venv_libero_plus}"
+if [ ! -x "${LIBERO_PLUS_VENV}/bin/python" ]; then
+  imagewam_run env UV_PROJECT_ENVIRONMENT="${LIBERO_PLUS_VENV}" uv sync --python 3.11 --extra shared
+fi
 
 # System libs need root. libgl1-mesa-glx does not exist on Ubuntu 24.04; libgl1
 # is the package that provides libGL.so.1 there (and on older releases too).
@@ -20,7 +30,7 @@ if [ "$(id -u)" -ne 0 ]; then
   APT_PREFIX=(sudo)
 fi
 imagewam_run "${APT_PREFIX[@]}" apt-get install -y libosmesa6-dev libgl1 libglfw3 unzip libexpat1 libfontconfig1-dev libpython3-stdlib libmagickwand-dev
-imagewam_run uv pip install mujoco==3.3.2 robosuite==1.4.0 bddl==1.0.1 gym==0.25.2 easydict thop future cloudpickle opencv-python-headless scikit-image wand
+imagewam_run uv pip install --python "${LIBERO_PLUS_VENV}/bin/python" mujoco==3.3.2 robosuite==1.4.0 bddl==1.0.1 gym==0.25.2 easydict thop future cloudpickle opencv-python-headless scikit-image wand
 
 if [ ! -d "${LIBERO_PLUS_DIR}" ]; then
   mkdir -p "$(dirname "${LIBERO_PLUS_DIR}")"
@@ -36,7 +46,7 @@ if [ ! -d "${LIBERO_PLUS_ASSETS_DIR}" ]; then
 fi
 
 touch "${LIBERO_PLUS_DIR}/libero/__init__.py"
-LIBERO_PLUS_BENCHMARK_INIT="${LIBERO_PLUS_PKG_DIR}/benchmark/__init__.py" imagewam_run imagewam_python - <<'PATCHPY'
+LIBERO_PLUS_BENCHMARK_INIT="${LIBERO_PLUS_PKG_DIR}/benchmark/__init__.py" imagewam_run "${LIBERO_PLUS_VENV}/bin/python" - <<'PATCHPY'
 import os
 from pathlib import Path
 path = Path(os.environ['LIBERO_PLUS_BENCHMARK_INIT'])
@@ -49,7 +59,7 @@ elif new not in text:
     raise RuntimeError(f'Could not patch torch.load in {path}')
 PATCHPY
 
-LIBERO_PLUS_ENV_WRAPPER="${LIBERO_PLUS_PKG_DIR}/envs/env_wrapper.py" imagewam_run imagewam_python - <<'PATCHPY'
+LIBERO_PLUS_ENV_WRAPPER="${LIBERO_PLUS_PKG_DIR}/envs/env_wrapper.py" imagewam_run "${LIBERO_PLUS_VENV}/bin/python" - <<'PATCHPY'
 import os
 from pathlib import Path
 path = Path(os.environ['LIBERO_PLUS_ENV_WRAPPER'])
@@ -62,7 +72,7 @@ elif new not in text:
     raise RuntimeError(f'Could not patch bddl_file_name Path handling in {path}')
 PATCHPY
 
-(cd "${LIBERO_PLUS_DIR}" && imagewam_run uv pip install -e .)
+(cd "${LIBERO_PLUS_DIR}" && imagewam_run uv pip install --python "${LIBERO_PLUS_VENV}/bin/python" -e .)
 mkdir -p "${LIBERO_CONFIG_DIR}/config_backups"
 cp "${LIBERO_CONFIG_DIR}/config.yaml" "${LIBERO_CONFIG_DIR}/config_backups/config.$(date +%Y%m%d_%H%M%S).yaml" 2>/dev/null || true
 rm -f "${LIBERO_CONFIG_DIR}/config.yaml"
@@ -72,7 +82,7 @@ rm -f "${LIBERO_CONFIG_DIR}/config.yaml"
 # that prompt, then write the real config using LIBERO's own default-path logic.
 # LIBERO_PKG_DIR is passed explicitly because LIBERO-plus installs a package also
 # named "libero", so the import target is ambiguous when both are installed.
-LIBERO_CONFIG_DIR="${LIBERO_CONFIG_DIR}" LIBERO_PKG_DIR="${LIBERO_PLUS_PKG_DIR}" imagewam_run imagewam_python - <<'PATCHPY'
+LIBERO_CONFIG_DIR="${LIBERO_CONFIG_DIR}" LIBERO_PKG_DIR="${LIBERO_PLUS_PKG_DIR}" imagewam_run "${LIBERO_PLUS_VENV}/bin/python" - <<'PATCHPY'
 import os
 import tempfile
 from pathlib import Path

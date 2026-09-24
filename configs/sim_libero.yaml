@@ -46,6 +46,11 @@ EVALUATION:
 
 MULTIRUN:
   create_only: false
+  # Resume an interrupted run instead of evaluating from scratch: either a run directory
+  # (the "Evaluation results will be saved to" path of the previous run) or "latest" for the
+  # newest resumable run under evaluate_results/<family>/<ckpt_tag>/. The existing task list
+  # is reused and tasks that already have results are skipped.
+  resume_from: null
   task_file: null
   task_suite_names:
     - libero_10

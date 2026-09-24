@@ -50,9 +50,34 @@ NUM_GPUS=1 MAX_TASKS_PER_GPU=2 FLUX2_VARIANT=4b bash scripts/flux2/run_eval_flux
 LIBERO_PLUS_FIX_LANG=1 NUM_GPUS=8 FLUX2_VARIANT=4b bash scripts/flux2/run_eval_flux2_libero_plus.sh
 ```
 
+The two benchmarks cannot share an environment: LIBERO and LIBERO-plus are different forks that
+both install a package named `libero`, so each gets its own venv — `.venv` for LIBERO and
+`.venv_libero_plus` for LIBERO-plus, built by `scripts/setup/_install_libero_env.sh` and
+`scripts/setup/_install_libero_plus_env.sh`. Each launcher selects its own venv (for the manager
+*and* the workers) plus its own asset paths via `LIBERO_CONFIG_PATH` (`~/.libero` vs
+`~/.libero_plus`), so switching benchmarks means running the other launcher — no reinstall. A
+launcher pointed at a venv holding the other benchmark stops with an error instead of silently
+evaluating the wrong task set. Note that a bare `uv sync` on `.venv_libero_plus` removes its
+`libero` overlay, exactly as it does for `.venv_rb2`; re-run the install script instead.
+
 Both launchers run the manager in `experiments/libero/`; results are written per task as
 `gpu*_task*_results.json` with `summary.json` and `task_success_rates.csv` alongside. Aggregate the
 LIBERO-Plus run per axis with `scripts/aggregate.py` in the LIT hub.
+
+A run that dies partway (preemption, OOM, a killed GPU) resumes at task granularity rather than
+restarting. Pass the directory the previous run printed, or let the launcher pick the newest
+resumable run for the same checkpoint:
+
+```bash
+RESUME_DIR=evaluate_results/libero_omnigen2/model/20260923_201444 bash scripts/flux2/run_eval_flux2_libero.sh
+RESUME=1 bash scripts/flux2/run_eval_flux2_libero.sh
+```
+
+The run's `tasks.txt` is reused, tasks that already have a results file are skipped (chunks are
+rebuilt around them), and the summary is regenerated from everything on disk. A task interrupted
+mid-episode is evaluated again from its first trial, which is the finest granularity the results
+files carry. Resuming with a different checkpoint or `EVALUATION.num_trials` warns, since tasks
+that already finished keep the settings they were produced with.
 
 Rollout MP4s are **off by default**: writing one means holding every frame of an episode in memory and
 encoding it at the end. Pass `SAVE_ROLLOUT_VIDEO=true` (equivalently `EVALUATION.save_rollout_video=true`)

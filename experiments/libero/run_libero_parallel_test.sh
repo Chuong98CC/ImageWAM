@@ -34,12 +34,17 @@ run_libero_eval() {
     export WORKER_ENV_SOURCE
     WORKER_PYTHONPATH=${WORKER_PYTHONPATH:-${PYTHONPATH:-}}
     export WORKER_PYTHONPATH
+    # Resume mode (set by run_libero_manager.py from MULTIRUN.resume_from): keep the results
+    # already on disk and only schedule the tasks that do not have one yet.
+    RESUME=${RESUME:-false}
+    export RESUME
 
     echo "EXP_NAME: $EXP_NAME"
     echo "MUJOCO_GL: $MUJOCO_GL"
     echo "PYOPENGL_PLATFORM: $PYOPENGL_PLATFORM"
     echo "WORKER_ENV_SOURCE: $WORKER_ENV_SOURCE"
     echo "WORKER_PYTHONPATH: $WORKER_PYTHONPATH"
+    echo "RESUME: $RESUME"
     
     # Create the output directory
     mkdir -p "$OUTPUT_DIR"
@@ -93,6 +98,12 @@ run_libero_eval() {
     FAILED_TASKS_FILE="$OUTPUT_DIR/failed_tasks.txt"
 
     mkdir -p "$TASK_STATUS_DIR" "$TASK_LOG_DIR"
+    if [ "$RESUME" = "true" ] && [ -s "$FAILED_TASKS_FILE" ]; then
+        # The failures of the interrupted run are about to be retried: keep them for the
+        # record, then start this attempt with an empty list.
+        cp "$FAILED_TASKS_FILE" "$OUTPUT_DIR/failed_tasks.prev.txt"
+        echo "Kept the previous failure list: $OUTPUT_DIR/failed_tasks.prev.txt"
+    fi
     : > "$FAILED_TASKS_FILE"
     
     # Initialize GPU load tracking
@@ -465,6 +476,22 @@ run_libero_eval() {
     # Main loop for dynamic task scheduling
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting dynamic task scheduling..."
     
+    # Whether a task already produced results. The results file name carries the GPU id,
+    # so match on the suite directory and the task id only.
+    task_result_exists() {
+        local suite=$1
+        local task_id=$2
+        compgen -G "$OUTPUT_DIR/$suite/gpu*_task${task_id}_results.json" > /dev/null 2>&1
+    }
+
+    # Count unique (suite, task) results rather than files: a task relaunched after an
+    # interrupted run leaves one file per GPU, and a raw file count would overshoot
+    # total_tasks and never satisfy the completion check in the scheduling loop.
+    count_completed_tasks() {
+        find "$OUTPUT_DIR" -type f -name "gpu*_task*_results.json" \
+            | sed -E 's#/gpu[0-9]+_#/#' | sort -u | wc -l
+    }
+
     local total_tasks=$(wc -l < "$task_list_file")
     local total_chunks=0
     TASK_CHUNK_DIR="$OUTPUT_DIR/task_chunks"
@@ -479,8 +506,15 @@ run_libero_eval() {
     current_first_task_id=""
     current_chunk_count=0
     chunk_idx=0
+    resume_skipped_tasks=0
     while IFS=, read -r suite task_id; do
         [ -z "$suite" ] && continue
+        # Resume: drop finished tasks from the schedule. Chunks are then rebuilt over what
+        # is left, so a chunk interrupted halfway only re-runs its unfinished tasks.
+        if [ "$RESUME" = "true" ] && task_result_exists "$suite" "$task_id"; then
+            resume_skipped_tasks=$((resume_skipped_tasks + 1))
+            continue
+        fi
         if [ "$current_chunk_count" -eq 0 ]; then
             current_chunk_id=$(printf "chunk_%06d" "$chunk_idx")
             current_chunk_file="$TASK_CHUNK_DIR/${current_chunk_id}.txt"
@@ -498,6 +532,19 @@ run_libero_eval() {
         fi
     done < "$task_list_file"
     cp "$TASK_CHUNK_LIST_FILE" "$PENDING_TASKS_FILE"
+    if [ "$RESUME" = "true" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Resume: $resume_skipped_tasks/$total_tasks tasks already have results"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Resume: $total_chunks chunks left to schedule"
+        if [ "$total_chunks" -eq 0 ]; then
+            # Everything in tasks.txt is already done, so the run ends immediately. Say so
+            # explicitly: pointing a resume at the wrong directory (or at results from a
+            # different benchmark that reuses the suite/task ids) otherwise finishes in
+            # seconds and reports a summary that has nothing to do with this invocation.
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Resume: WARNING nothing left to run - every task in the"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Resume: task list already has results. The summary is"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Resume: from those earlier results, not from this run."
+        fi
+    fi
 
     local monitoring_interval=${MONITORING_INTERVAL:-10}  # Monitoring interval in seconds
     local last_status_time=0
@@ -581,7 +628,7 @@ run_libero_eval() {
         fi
 
         # Check whether all tasks have completed
-        total_completed=$(find "$OUTPUT_DIR" -type f -name "gpu*_task*_results.json" | wc -l)
+        total_completed=$(count_completed_tasks)
         if [ "$total_completed" -eq "$total_tasks" ]; then
             echo "All tasks are complete!"
             break

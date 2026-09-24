@@ -125,6 +125,12 @@ def _resolve_tagged_output_dir(raw_output_dir: Path, ckpt_tag: str) -> Path:
     if run_ts == "":
         raise ValueError(f"Invalid EVALUATION.output_dir (missing run timestamp): {raw_output_dir}")
 
+    # A directory that already holds a manager_config.yaml is a run root created by
+    # run_libero_manager.py. Honor it verbatim: the scheduler counts results in the directory
+    # it exports, so a worker must not re-tag itself into a different one.
+    if (raw_output_dir / "manager_config.yaml").exists():
+        return raw_output_dir.resolve()
+
     eval_root = (project_root / "evaluate_results").resolve()
     try:
         relative = raw_output_dir.resolve().relative_to(eval_root)
